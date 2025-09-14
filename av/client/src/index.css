@@ -1,0 +1,50 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+/* 2. Include Tailwind's base styles */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 3. Define our new Design System at the base layer */
+@layer base {
+  :root {
+    /*
+      THE FIX: Define the color variables using the complete rgb() function.
+      This ensures the syntax is valid and universally understood.
+    */
+    --color-background: rgb(248 250 252); /* neutral-50 */
+    --color-text-primary: rgb(15 23 42);   /* neutral-900 */
+    --color-text-secondary: rgb(71 85 105);/* neutral-600 */
+  }
+
+  body {
+    /* Apply our new font and colors to the entire app */
+    font-family: 'Inter', sans-serif;
+    /* Use the corrected variables directly */
+    background-color: var(--color-background);
+    color: var(--color-text-primary);
+
+    /* Enable smoother font rendering */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+
+    /* Remove the blue highlight on tap for mobile devices */
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* A base style for cleaner-looking form elements */
+  button, input, select {
+    outline: none !important;
+  }
+}
+
+/* A utility class for hiding scrollbars, which we can keep */
+@layer utilities {
+  .hide-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .hide-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}
