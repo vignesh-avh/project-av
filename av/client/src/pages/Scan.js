@@ -17,6 +17,8 @@ export default function Scan({ onClose, onProductSaved }) {
   const [price, setPrice] = useState("");
   const [unit, setUnit] = useState("per_kg");
   const [count, setCount] = useState(""); // ADDED
+  const [isPredicting, setIsPredicting] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [, /* isCameraActive not used */ setIsCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState(null);
   const videoRef = useRef(null);
@@ -124,7 +126,8 @@ export default function Scan({ onClose, onProductSaved }) {
 
   const handleUpload = async () => {
     if (!image) return toast.error("Please capture an image first.");
-
+    
+    setIsPredicting(true); // Start loading
     const formData = new FormData();
     formData.append("file", image);
 
@@ -133,44 +136,42 @@ export default function Scan({ onClose, onProductSaved }) {
         method: "POST",
         body: formData,
       });
-
       if (!res.ok) throw new Error("Prediction failed");
 
       const data = await res.json();
       setPredictedName(data.product_name || "Could not predict");
     } catch (err) {
       toast.error("Error contacting backend: " + err.message);
+    } finally {
+      setIsPredicting(false); // Stop loading
     }
   };
 
   const handleSubmit = async () => {
+    // ... all of your existing validation if-statements go here ...
     if (!validateProductName(predictedName)) {
       toast.error("Invalid product name. Only letters, numbers and basic punctuation are allowed.");
       return;
     }
-    if (!count || isNaN(parseInt(count)) || parseInt(count) <= 0) { // Also check for 0
+    if (!count || isNaN(parseInt(count)) || parseInt(count) <= 0) {
       toast.error("Please enter a valid count greater than zero.");
       return;
     }
-
-    // ADD THIS VALIDATION FOR THE PRICE FIELD
     if (!price || isNaN(parseFloat(price)) || parseFloat(price) <= 0) {
       toast.error("Please enter a valid price greater than zero.");
       return;
     }
-
     if (!image) {
       toast.error("Please capture an image of the product before saving.");
       return;
     }
-
     const userId = sessionStorage.getItem("userId");
     if (!userId) {
       toast.error("User ID not found. Please log in again.");
       return;
     }
-    
-    // Use FormData to send both the image file and text fields together.
+
+    setIsSaving(true); // Start loading
     const formData = new FormData();
     formData.append("file", image);
     formData.append("product_name", predictedName);
@@ -180,13 +181,10 @@ export default function Scan({ onClose, onProductSaved }) {
     formData.append("count", count);
 
     try {
-      // Send the FormData. The browser will automatically set the
-      // correct 'Content-Type: multipart/form-data' header.
       const res = await fetch(`${API_BASE}/add-product/`, {
         method: "POST",
         body: formData,
       });
-
       const data = await res.json();
       
       if (data.product_id && data.product) {
@@ -195,18 +193,10 @@ export default function Scan({ onClose, onProductSaved }) {
       } else {
         toast.error("Save failed: " + (data.error || "Unknown error"));
       }
-
-      // Reset form
-      setPredictedName("");
-      setPrice("");
-      setUnit("per_kg");
-      setCount("");
-      setImage(null);
-      setPreviewUrl(null);
-      // Optionally restart the camera
-      // startCamera();
     } catch (err) {
       toast.error("Error saving product: " + err.message);
+    } finally {
+      setIsSaving(false); // Stop loading
     }
   };
 
@@ -215,7 +205,7 @@ export default function Scan({ onClose, onProductSaved }) {
     <div className="flex flex-col h-full">
       <div className="p-4 border-b border-neutral-200 flex justify-between items-center">
         <h2 className="text-xl font-bold">Add New Product</h2>
-        <button onClick={onClose} className="text-2xl text-neutral-500 hover:text-neutral-800">&times;</button>
+        <button onClick={onClose} className="text-2xl text-neutral-500 hover:text-neutral-800">×</button>
       </div>
       
       <div className="flex-1 p-6 space-y-6 overflow-y-auto">
@@ -237,8 +227,17 @@ export default function Scan({ onClose, onProductSaved }) {
         ) : (
           <div className="space-y-4">
             <img src={previewUrl} alt="Captured product" className="w-full max-w-sm mx-auto rounded-xl border-2 border-primary" />
-            <Button onClick={handleUpload}>
-              <ArrowUpOnSquareIcon className="h-5 w-5 mr-2" /> Predict Product
+            <Button onClick={handleUpload} disabled={isPredicting}>
+              {isPredicting ? (
+                <>
+                  <div className="h-5 w-5 border-2 border-t-transparent border-white rounded-full animate-spin mr-2"></div>
+                  Predicting...
+                </>
+              ) : (
+                <>
+                  <ArrowUpOnSquareIcon className="h-5 w-5 mr-2" /> Predict Product
+                </>
+              )}
             </Button>
           </div>
         )}
@@ -249,18 +248,27 @@ export default function Scan({ onClose, onProductSaved }) {
             <Input value={predictedName} onChange={(e) => setPredictedName(e.target.value)} placeholder="Product name" />
             <Input type="number" value={price} onChange={(e) => setPrice(e.target.value)} placeholder="Price" />
             <Input type="number" value={count} onChange={(e) => setCount(e.target.value)} placeholder="Stock Count (e.g., 20)" />
+            
             <select value={unit} onChange={(e) => setUnit(e.target.value)} className="w-full p-3 border border-neutral-300 rounded-lg">
               <option value="per_kg">per kg</option>
               <option value="per_100g">per 100g</option>
               <option value="per_piece">per piece</option>
             </select>
-            <Button onClick={handleSubmit}>
-              <CheckCircleIcon className="h-5 w-5 mr-2" /> Save Product
+            <Button onClick={handleSubmit} disabled={isSaving}>
+              {isSaving ? (
+                <>
+                  <div className="h-5 w-5 border-2 border-t-transparent border-white rounded-full animate-spin mr-2"></div>
+                  Saving...
+                </>
+              ) : (
+                <>
+                  <CheckCircleIcon className="h-5 w-5 mr-2" /> Save Product
+                </>
+              )}
             </Button>
           </div>
         )}
       </div>
     </div>
-  );
-// =======================================================================
+  )
 }
