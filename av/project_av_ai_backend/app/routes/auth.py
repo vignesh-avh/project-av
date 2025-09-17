@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi import APIRouter, HTTPException, Depends, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
 from jose import jwt
 from datetime import datetime, timedelta
@@ -51,7 +51,7 @@ def create_access_token(data: dict):
         "role": data.get("role", "customer"),
         "onboarding_done": data.get("onboarding_done", False),
         "has_entered_referral": data.get("has_entered_referral", False),
-        "uid": data.get("uid", ""),  # Added uid claim
+        "uid": user_id, # Added uid claim
         "coins": data.get("coins", 0),  # ADDED COINS CLAIM
         "subscription_active": subscription_active,
     })
@@ -61,6 +61,9 @@ def create_access_token(data: dict):
 class GoogleAuthRequest(BaseModel):
     access_token: str
     role: str  # Added role field as requested
+class UserLoginRequest(BaseModel):
+    email: str
+    password: str
 
 @router.post("/signup")
 async def signup(user: User):
@@ -119,6 +122,34 @@ async def signup(user: User):
     except Exception as e:
         print(f"Signup error: {str(e)}")
         raise HTTPException(status_code=500, detail="User creation failed")
+
+# Add this new endpoint function to your file
+@router.post("/login")
+async def login(credentials: UserLoginRequest):
+    # Find the user by their email in the database
+    user = users_collection.find_one({"email": credentials.email})
+
+    # Check if the user exists and if the provided password is correct
+    if not user or not verify_password(credentials.password, user.get("password_hash")):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # If credentials are correct, create a new access token with the user's data
+    access_token = create_access_token(
+        data={
+            "sub": str(user["_id"]),
+            "role": user.get("role", "customer"),
+            "onboarding_done": user.get("onboarding_done", False),
+            "has_entered_referral": user.get("hasEnteredReferral", False),
+            "uid": user.get("uid", ""),
+            "coins": user.get("coins", 0)
+        }
+    )
+    
+    return {"access_token": access_token, "token_type": "bearer"}        
 
 # UPDATED Google auth endpoint as requested
 @router.post("/google-auth")

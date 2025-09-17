@@ -83,7 +83,7 @@ load_dotenv(dotenv_path)
 razorpay_client = razorpay.Client(auth=(os.getenv("RAZORPAY_KEY_ID"), os.getenv("RAZORPAY_KEY_SECRET")))
 
 # Get JWT secret and algorithm from environment
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "default_secret")
+SECRET_KEY = os.getenv("SECRET_KEY", "default_secret")
 ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 
 app = FastAPI(debug=True)
