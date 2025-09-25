@@ -23,7 +23,7 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from app.routes.shops import haversine
 from datetime import datetime, timedelta, timezone
-import certifi
+
 
 from fastapi import Form
 import jwt  # Added for token verification
@@ -193,13 +193,10 @@ def startup_db_client():
     MONGO_URI = os.getenv("MONGO_URI")
     if not MONGO_URI:
         raise ValueError("MONGO_URI environment variable not set")
-
+    
     global client, db, products_collection, cart_collection, shops_collection, rewards_collection, users_collection, payments_collection
-
-    # Use certifi to provide the necessary SSL certificates
-    ca = certifi.where()
-    client = MongoClient(MONGO_URI, tlsCAFile=ca)
-
+    
+    client = MongoClient(MONGO_URI)
     db = client["project_av"]
     products_collection = db["products"]
     cart_collection = db["cart"]
@@ -207,12 +204,13 @@ def startup_db_client():
     rewards_collection = db["rewards"]
     users_collection = db["users"]
     payments_collection = db["payments"]
-
+    
+    # Add new collections
     global product_views_collection, product_sales_collection
     product_views_collection = db["product_views"]
     product_sales_collection = db["product_sales"]
-
-    print("✅ Connected to MongoDB with payments collection")
+    
+    print("✅ Connected to MongoDB with payments collection")  # Updated message
 
     try:
         cloudinary.config(
@@ -1054,6 +1052,7 @@ async def get_user(user_id: str = Query(...)):
                 user['_id'] = str(user['_id'])
                 
             return {
+                "id": user.get("_id"),
                 "email": user.get("email", ""),
                 "fullName": user.get("fullName", ""),
                 "city": user.get("city", ""),
@@ -1737,34 +1736,7 @@ async def record_sale(product_id: str, shop_id: str, quantity: int = 1):
 # ======== END OF NEW ENDPOINTS ========
 
 # ======== ADDED TRENDING PRODUCTS ENDPOINT ========
-@app.get("/products/trending")
-async def get_trending_products(limit: int = 6):
-    try:
-        pipeline = [
-            {"$match": {"inStock": True}},
-            {"$sort": {"sale_count": -1}},
-            {"$limit": limit},
-            {"$lookup": {
-                "from": "shops",
-                "localField": "shop_id",
-                "foreignField": "_id",
-                "as": "shop"
-            }},
-            {"$unwind": {"path": "$shop", "preserveNullAndEmptyArrays": True}},
-            {"$project": {
-                "_id": {"$toString": "$_id"},  # Convert ObjectId to string
-                "product_name": 1,
-                "price": 1,
-                "unit": 1,
-                "shop_name": "$shop.name",
-                "sale_count": 1
-            }}
-        ]
-        trending = list(products_collection.aggregate(pipeline))
-        return {"products": trending}
-    except Exception as error:
-        print(f"Trending products error: {error}")
-        return {"products": []}
+
 # ======== END OF TRENDING PRODUCTS ENDPOINT ========
 
 app.include_router(shops_router)

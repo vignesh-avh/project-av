@@ -379,7 +379,8 @@ async def get_trending_products(
             # First, match only products that are in stock and from a nearby shop
             {"$match": {
                 "shop_id": {"$in": nearby_shop_ids},
-                "inStock": True
+                "inStock": True,
+                "isOnSale": {"$ne": True}
             }},
 
             {"$addFields": {
@@ -490,22 +491,39 @@ async def get_best_price_products(
         if not nearby_shop_ids:
             return {"products": []}
 
-        # Step 2: Build a pipeline to find best-priced products ONLY from nearby shops
         pipeline = [
-            # First, match only products that are in stock and from a nearby shop
+            # 1. Match products from nearby shops that are in stock
             {"$match": {
                 "shop_id": {"$in": nearby_shop_ids},
-                "inStock": True
+                "inStock": True,
+                "isOnSale": {"$ne": True}
             }},
 
-            {"$sort": {"price": pymongo.ASCENDING}},
+            # 2. Add sale_count field, defaulting to 0 if it's missing
+            {"$addFields": {
+                "sale_count": {"$ifNull": ["$sale_count", 0]}
+            }},
+
+            # 3. Sort by MOST SOLD first, then by CHEAPEST price as a tie-breaker
+            {"$sort": {
+                "sale_count": pymongo.DESCENDING,
+                "price": pymongo.ASCENDING
+            }},
+
+            # 4. Limit the results to the top items overall
+            {"$limit": limit * 2}, # Fetch a slightly larger pool to ensure variety
+
+            # 5. Group by product name to get the best one for each type
             {"$group": {
                 "_id": "$product_name",
-                "best_price_product": {"$first": "$$ROOT"}
+                "best_product": {"$first": "$$ROOT"}
             }},
-            {"$replaceRoot": {"newRoot": "$best_price_product"}},
+            {"$replaceRoot": {"newRoot": "$best_product"}},
+
+            # 6. Final limit for display
             {"$limit": limit},
-            # FIXED: Corrected lookup using ObjectId conversion
+
+            # 7. Add shop data (lookup)
             {"$lookup": {
                 "from": "shops",
                 "let": {"shop_id": {"$toObjectId": "$shop_id"}},
@@ -517,11 +535,8 @@ async def get_best_price_products(
                 "as": "shop_data"
             }},
             {"$unwind": {"path": "$shop_data", "preserveNullAndEmptyArrays": True}},
-            {"$addFields": {
-                "shop_name": "$shop_data.name",  # ✅ Actual shop name
-                "shop_latitude": "$shop_data.latitude",
-                "shop_longitude": "$shop_data.longitude"
-            }},
+
+            # 8. Project the final fields for the response
             {"$project": {
                 "_id": {"$toString": "$_id"},
                 "product_name": 1,
@@ -529,9 +544,9 @@ async def get_best_price_products(
                 "unit": 1,
                 "imageUrl": 1,
                 "shop_id": 1,
-                "shop_name": 1,  # Include shop_name in projection
-                "shop_latitude": 1,
-                "shop_longitude": 1,
+                "shop_name": "$shop_data.name",
+                "shop_latitude": "$shop_data.latitude",
+                "shop_longitude": "$shop_data.longitude",
                 "isOnSale": {"$ifNull": ["$isOnSale", False]},
                 "salePrice": "$salePrice",
                 "saleDescription": "$saleDescription",
@@ -544,27 +559,6 @@ async def get_best_price_products(
                         "else": None
                     }
                 },
-                "location": {
-                    "type": "Point",
-                    "coordinates": ["$shop_data.longitude", "$shop_data.latitude"]
-                },
-                "isOnSale": {"$ifNull": ["$isOnSale", False]},
-                "salePrice": "$salePrice",
-                "saleDescription": "$saleDescription",
-                "distance": {
-                    "$cond": {
-                        "if": {
-                            "$and": [
-                                {"$ne": [user_lat, None]},
-                                {"$ne": [user_lng, None]},
-                                {"$ne": ["$shop_latitude", None]},
-                                {"$ne": ["$shop_longitude", None]}
-                            ]
-                        },
-                        "then": None,
-                        "else": None
-                    }
-                }
             }}
         ]
         best_price = list(products_collection.aggregate(pipeline))

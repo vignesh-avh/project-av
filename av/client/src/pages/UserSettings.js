@@ -7,6 +7,7 @@ import { API_BASE } from "../config";
 export default function UserSettings() {
   const [userData, setUserData] = useState({ fullName: "", email: "", city: "" });
   const [initialData, setInitialData] = useState({ fullName: "", city: "" });
+  const [userDbId, setUserDbId] = useState(null); // ===== 1. ADD THIS NEW STATE =====
   const [loading, setLoading] = useState(true);
   const [saveLoading, setSaveLoading] = useState(false);
   const [message, setMessage] = useState({ type: '', text: '' });
@@ -39,6 +40,7 @@ export default function UserSettings() {
         };
         setUserData(profile);
         setInitialData({ fullName: profile.fullName, city: profile.city });
+        setUserDbId(data.id); // ===== 2. STORE THE CORRECT DATABASE ID =====
       } catch (error) {
         setMessage({ type: 'error', text: 'Failed to load user data.' });
       } finally {
@@ -56,11 +58,12 @@ export default function UserSettings() {
     setSaveLoading(true);
     setMessage({ type: '', text: '' });
     try {
-      const userId = sessionStorage.getItem("userId");
+      // const userId = sessionStorage.getItem("userId"); // This was the incorrect ID for customers
       const response = await fetch(`${API_BASE}/update-user-profile`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: userId, fullName: userData.fullName.trim(), city: userData.city.trim() })
+        // ===== 3. USE THE CORRECT ID FROM STATE IN THE REQUEST BODY =====
+        body: JSON.stringify({ user_id: userDbId, fullName: userData.fullName.trim(), city: userData.city.trim() })
       });
       if (!response.ok) {
         const errData = await response.json();
