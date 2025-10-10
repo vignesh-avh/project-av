@@ -1,26 +1,39 @@
-import requests
+# In a file like app/utils/oauth.py
+
 from pydantic import BaseModel
+from google.oauth2 import id_token
+from google.auth.transport import requests
+
+# Make sure this is imported from your main config file (e.g., app/config.py)
+# This MUST be your WEB CLIENT ID.
+from app.config import GOOGLE_WEB_CLIENT_ID 
 
 class GoogleUser(BaseModel):
     email: str
     name: str
 
-def get_google_user_info(access_token: str) -> GoogleUser:
+def get_google_user_info(token: str) -> GoogleUser | None:
+    """
+    Verifies a Google ID Token and returns the user's information.
+    This is the modern, secure method.
+    """
     try:
-        response = requests.get(
-            "https://www.googleapis.com/oauth2/v3/userinfo",
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=10  # Add timeout to prevent hanging
+        # This function checks the token's signature, expiration, and that it was
+        # issued to your app (by checking the Web Client ID).
+        id_info = id_token.verify_oauth2_token(
+            token, requests.Request(), GOOGLE_WEB_CLIENT_ID
         )
-        if response.status_code != 200:
-            print(f"Google API error: {response.status_code} - {response.text}")
-            return None
-        
-        user_info = response.json()
+
+        # If verification is successful, extract the user's info
         return GoogleUser(
-            email=user_info["email"],
-            name=user_info.get("name", user_info["email"].split('@')[0])
+            email=id_info["email"],
+            name=id_info.get("name", "")
         )
+
+    except ValueError as e:
+        # This will catch any error: invalid token, expired token, or wrong Client ID
+        print(f"Google ID Token verification error: {e}")
+        return None
     except Exception as e:
-        print(f"Google user info error: {str(e)}")
+        print(f"An unexpected error occurred during token verification: {e}")
         return None

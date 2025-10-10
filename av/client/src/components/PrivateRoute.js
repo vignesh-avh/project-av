@@ -71,16 +71,16 @@ async function validateToken({ navigate, pathname, setStatus, requiredRole }) {
 
     // If the customer backend says the account is locked, redirect immediately.
     if (customerLockStatus === 'expired_locked' && pathname !== '/subscription') {
-        navigate("/subscription", { replace: true });
-        setStatus("checking"); // Prevents rendering of the protected component
-        return;
+      navigate("/subscription", { replace: true });
+      setStatus("checking"); // Prevents rendering of the protected component
+      return;
     }
-    
+
     // ===== ADD THIS BLOCK TO HANDLE OWNER LOCKOUT =====
     if (ownerLockStatus === 'expired' && pathname !== '/subscription') {
-        navigate("/subscription", { replace: true });
-        setStatus("checking");
-        return;
+      navigate("/subscription", { replace: true });
+      setStatus("checking");
+      return;
     }
     // ==================================================
 

@@ -17,6 +17,10 @@ export const signup = async (userData) => {
   const response = await axios.post(`${API_BASE}/auth/signup`, userData);
   return response.data;
 };
+export const verifyOtp = async (email, otp) => {
+  const response = await axios.post(`${API_BASE}/auth/verify-otp`, { email, otp });
+  return response.data;
+};
 
 export const googleLogin = async (data) => {
   const response = await axios.post(`${API_BASE}/auth/google-auth`, data);

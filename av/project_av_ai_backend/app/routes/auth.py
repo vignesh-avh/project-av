@@ -1,3 +1,4 @@
+print("--- !!! NEW VERSION OF AUTH.PY  !!! ---") 
 from fastapi import APIRouter, HTTPException, Depends, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
 from jose import jwt
@@ -7,6 +8,11 @@ from app.utils.security import verify_password, get_password_hash
 from app.utils.oauth import get_google_user_info
 from app.db import users_collection
 from app.config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
+from app.utils.email import send_otp_email # <--- ADD THIS IMPORT
+from fastapi import BackgroundTasks
+
+# We still need this one from config.py for the token expiry
+from app.config import ACCESS_TOKEN_EXPIRE_MINUTES
 import random
 import uuid  # Added for UID generation
 from pydantic import BaseModel  # Added import
@@ -15,6 +21,8 @@ from fastapi import Header
 from bson import ObjectId   # 🔧 ADD THIS IMPORT REQUIRED FOR refresh-token
 from app.utils.security import create_access_token # Ensure this function is imported
 import logging # Recommended for logging
+from bson import datetime as bson_datetime
+
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -66,78 +74,85 @@ class UserLoginRequest(BaseModel):
     password: str
 
 @router.post("/signup")
-async def signup(user: User):
-    try:
-        # Check if user already exists
-        existing_user = users_collection.find_one({"email": user.email})
-        if existing_user:
-            raise HTTPException(status_code=400, detail="Email already registered")
-        
-        # Generate referral code
-        referral_code = ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))
-        
-        # Hash password
-        hashed_password = get_password_hash(user.password)
-        
-        # Create user document with UID field
+async def signup(user: User, background_tasks: BackgroundTasks):
+    existing_user = users_collection.find_one({"email": user.email})
+    
+    if existing_user and existing_user.get("is_verified"):
+        raise HTTPException(status_code=400, detail="Email already registered") 
+
+    otp = str(random.randint(100000, 999999))
+    # Use the correct datetime object
+    otp_expires_at = bson_datetime.datetime.utcnow() + timedelta(minutes=10)
+
+    background_tasks.add_task(send_otp_email, user.email, otp)
+    
+    if existing_user:
+        users_collection.update_one(
+            {"email": user.email},
+            {"$set": {
+                "password_hash": get_password_hash(user.password),
+                "fullName": user.fullName,
+                "city": user.city,
+                "email_otp": otp,
+                "otp_expires_at": otp_expires_at,
+                "created_at": bson_datetime.datetime.utcnow() 
+            }}
+        )
+    else:
         user_data = {
             "email": user.email,
             "fullName": user.fullName,
             "city": user.city,
             "role": user.role,
-            "password_hash": hashed_password,
-            "referral_code": referral_code,
+            "password_hash": get_password_hash(user.password),
+            "referral_code": ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6)),
+            "created_at": bson_datetime.datetime.utcnow(), # Use the correct datetime
+            "uid": user.email.replace(' ', '_').lower(),
+            "is_verified": False,
+            "email_otp": otp,
+            "otp_expires_at": otp_expires_at,
             "referral_count": 0,
             "referral_earnings": 0,
             "coins": 0,
             "wallet_balance": 0,
-            "onboarding_done": False,  # ENSURED FIELD EXISTS AS REQUESTED
+            "onboarding_done": False,
             "hasEnteredReferral": False,
-            "created_at": datetime.utcnow(),
-            "next_payment_date": datetime.utcnow() + timedelta(days=30),
-            "uid": user.email.replace(' ', '_').lower() if user.email else str(uuid.uuid4())  # Updated with fallback
         }
+        users_collection.insert_one(user_data)
         
-        # Insert into database with duplicate UID handling
-        try:
-            result = users_collection.insert_one(user_data)
-        except mongo_errors.DuplicateKeyError:
-            # Handle rare case of UUID collision
-            user_data["uid"] = str(uuid.uuid4())
-            result = users_collection.insert_one(user_data)
-        
-        # ✅ FIX: Include role and onboarding status in token
-        access_token = create_access_token(
-            data={
-                "sub": str(result.inserted_id),
-                "role": user_data["role"],
-                "onboarding_done": (user_data["role"] == "customer"),
-                "has_entered_referral": False,
-                "uid": str(result.inserted_id)  # Added UID
-            }
-        )
-        return {"access_token": access_token, "token_type": "bearer"}
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        print(f"Signup error: {str(e)}")
-        raise HTTPException(status_code=500, detail="User creation failed")
+    return {"message": "OTP has been sent to your email."}
 
-# Add this new endpoint function to your file
-@router.post("/login")
-async def login(credentials: UserLoginRequest):
-    # Find the user by their email in the database
-    user = users_collection.find_one({"email": credentials.email})
+class OtpVerificationRequest(BaseModel):
+    email: str
+    otp: str
 
-    # Check if the user exists and if the provided password is correct
-    if not user or not verify_password(credentials.password, user.get("password_hash")):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+@router.post("/verify-otp")
+async def verify_otp(request: OtpVerificationRequest):
+    user = users_collection.find_one({"email": request.email})
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
     
-    # If credentials are correct, create a new access token with the user's data
+    if user.get("is_verified"):
+        raise HTTPException(status_code=400, detail="Account already verified.")
+
+    # This comparison now works because otp_expires_at is stored as a proper date
+    if user.get("otp_expires_at") < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="OTP has expired.")
+    
+    if user.get("email_otp") != request.otp:
+        raise HTTPException(status_code=400, detail="Invalid OTP.")
+
+    # Use the correct datetime object for the payment date
+    next_payment = bson_datetime.datetime.utcnow() + timedelta(days=30)
+    
+    users_collection.update_one(
+        {"email": request.email},
+        {
+            "$set": {"is_verified": True, "next_payment_date": next_payment},
+            "$unset": {"email_otp": "", "otp_expires_at": ""}
+        }
+    )
     access_token = create_access_token(
         data={
             "sub": str(user["_id"]),
@@ -148,10 +163,34 @@ async def login(credentials: UserLoginRequest):
             "coins": user.get("coins", 0)
         }
     )
-    
-    return {"access_token": access_token, "token_type": "bearer"}        
+    return {"access_token": access_token, "token_type": "bearer"}
 
-# UPDATED Google auth endpoint as requested
+@router.post("/login")
+async def login(credentials: UserLoginRequest):
+    user = users_collection.find_one({"email": credentials.email})
+
+    if not user or not verify_password(credentials.password, user.get("password_hash")): 
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+        )
+    
+    if not user.get("is_verified"):
+        raise HTTPException(status_code=403, detail="Account not verified. Please check your email for an OTP.")
+
+    access_token = create_access_token(
+        data={
+            "sub": str(user["_id"]),
+            "role": user.get("role", "customer"),
+            "onboarding_done": user.get("onboarding_done", False),
+            "has_entered_referral": user.get("hasEnteredReferral", False),
+            "uid": user.get("uid", ""),
+            "coins": user.get("coins", 0)
+        }
+    ) 
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
 @router.post("/google-auth")
 async def google_auth(request: GoogleAuthRequest):
     try:
@@ -162,24 +201,21 @@ async def google_auth(request: GoogleAuthRequest):
         user = users_collection.find_one({"email": user_info.email})
         
         if user:
-            # FIX: Validate role consistency
             if request.role and user["role"] != request.role:
                 raise HTTPException(
                     status_code=403,
                     detail="Account exists with different role"
                 )
             
-            # FIXED: Include has_entered_referral in token with consistent naming
             access_token = create_access_token({
                 "sub": str(user["_id"]),
                 "role": user["role"],
                 "onboarding_done": user.get("onboarding_done", False),
                 "has_entered_referral": user.get("hasEnteredReferral", False),
-                "uid": str(user["_id"])  # Consistent uid claim
+                "uid": str(user["_id"])
             })
             return {"access_token": access_token, "token_type": "bearer"}
         
-        # New user - create with requested role
         referral_code = await generate_referral_code()
         new_user_data = {
             "email": user_info.email,
@@ -193,21 +229,21 @@ async def google_auth(request: GoogleAuthRequest):
             "coins": 0,
             "wallet_balance": 0,
             "onboarding_done": False,
-            "hasEnteredReferral": False,  # Initialize as False
-            "created_at": datetime.utcnow(),
-            "next_payment_date": datetime.utcnow() + timedelta(days=30),
+            "hasEnteredReferral": False,
+            # Use the correct datetime object
+            "created_at": bson_datetime.datetime.utcnow(),
+            "next_payment_date": bson_datetime.datetime.utcnow() + timedelta(days=30),
             "uid": user_info.email.replace(' ', '_').lower() if user_info.email else str(uuid.uuid4())
         }
         
         result = users_collection.insert_one(new_user_data)
         
-        # FIXED: Consistent naming and added uid
         access_token = create_access_token({
             "sub": str(result.inserted_id),
             "role": request.role,
             "onboarding_done": False,
-            "has_entered_referral": False,  # Consistent naming
-            "uid": str(result.inserted_id)  # Added uid claim
+            "has_entered_referral": False,
+            "uid": str(result.inserted_id)
         })
         return {"access_token": access_token, "token_type": "bearer"}
         

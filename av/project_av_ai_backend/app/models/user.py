@@ -22,6 +22,9 @@ class UserInDB(User):
     hasEnteredReferral: bool = False
     created_at: datetime
     uid: str 
+    is_verified: bool = False
+    email_otp: Optional[str] = None
+    otp_expires_at: Optional[datetime] = None
 
 class GoogleUser(BaseModel):
     email: str

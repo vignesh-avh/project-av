@@ -24,6 +24,11 @@ from datetime import datetime, timedelta
 from app.routes.shops import haversine
 from datetime import datetime, timedelta, timezone
 
+import os
+import ssl
+import certifi
+
+os.environ['SSL_CERT_FILE'] = certifi.where()
 
 from fastapi import Form
 import jwt  # Added for token verification
