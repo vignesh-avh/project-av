@@ -288,7 +288,7 @@ async def get_shop_performance(owner_id: str, days: int = 7):
         # Get views data
         views_pipeline = [
             {"$match": {
-                "shop_id": shop_id,
+                "shop_id": ObjectId(shop_id),
                 "timestamp": {"$gte": start_date, "$lte": end_date},
                 "type": "view"
             }},
@@ -304,6 +304,7 @@ async def get_shop_performance(owner_id: str, days: int = 7):
         ]
         views_data = list(product_views_collection.aggregate(views_pipeline))
         
+        print(f"--- DEBUG: Raw views data from DB for shop {shop_id}: {views_data} ---")
         # Populate map with the fetched data
         for item in sales_data:
             if item["date"] in performance_map:
@@ -316,6 +317,7 @@ async def get_shop_performance(owner_id: str, days: int = 7):
         # Sort the data chronologically
         performance_data = sorted(performance_map.values(), key=lambda x: x["date"])
         
+        print(f"--- DEBUG: Final performance data sent to frontend: {performance_data} ---")
         return {"performance": performance_data}
     except Exception as e:
         print(f"Performance error: {str(e)}")
@@ -349,251 +351,146 @@ async def get_top_products(owner_id: str, limit: int = 3):
 # FIXED: Unified location handling in product endpoints
 @router.get("/products/trending")
 async def get_trending_products(
-    user_lat: float = Query(None),
-    user_lng: float = Query(None),
-    limit: int = 6
+    user_lat: float = Query(...),
+    user_lng: float = Query(...),
+    limit: int = 10,
+    skip: int = 0
 ):
     try:
-        if user_lat is None or user_lng is None:
-            print("Location not provided for trending products search; returning empty list.")
-            return {"products": []}
-        nearby_shops_cursor = shops_collection.find({
-            "location": {
-                "$nearSphere": {
-                    "$geometry": {
-                        "type": "Point",
-                        "coordinates": [user_lng, user_lat]
-                    },
-                    "$maxDistance": 20000
+        pipeline = [
+            {
+                "$geoNear": {
+                    "near": {"type": "Point", "coordinates": [user_lng, user_lat]},
+                    "distanceField": "distance_in_meters",
+                    "maxDistance": 5000, # 5 kilometers
+                    "spherical": True
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "products",
+                    "let": { "shop_id_str": { "$toString": "$_id" } },
+                    "pipeline": [ { "$match": { "$expr": { "$eq": [ "$shop_id", "$$shop_id_str" ] } } } ],
+                    "as": "products"
+                }
+            },
+            {"$unwind": "$products"},
+            {
+                "$match": {
+                    "products.inStock": True,
+                    "products.isOnSale": {"$ne": True}
+                }
+            },
+            # Sort by MOST SOLD first, then by distance
+            {"$sort": {"products.sale_count": -1, "distance_in_meters": 1}},
+            {"$skip": skip},
+            {"$limit": limit},
+            {
+                "$project": {
+                    "_id": {"$toString": "$products._id"},
+                    "product_name": "$products.product_name",
+                    "price": "$products.price",
+                    "unit": "$products.unit",
+                    "imageUrl": "$products.imageUrl",
+                    "shop_id": {"$toString": "$_id"},
+                    "shop_name": "$name",
+                    "distance": {"$divide": ["$distance_in_meters", 1000]},
+                    "isOnSale": "$products.isOnSale",
+                    "salePrice": "$products.salePrice",
+                    "saleDescription": "$products.saleDescription"
                 }
             }
-        })
-        nearby_shop_ids = [str(shop["_id"]) for shop in nearby_shops_cursor]
-
-        # If no shops are nearby, return an empty list immediately
-        if not nearby_shop_ids:
-            return {"products": []}
-
-        # Step 2: Build a pipeline to find trending products ONLY from those nearby shops
-        pipeline = [
-            # First, match only products that are in stock and from a nearby shop
-            {"$match": {
-                "shop_id": {"$in": nearby_shop_ids},
-                "inStock": True,
-                "isOnSale": {"$ne": True}
-            }},
-
-            {"$addFields": {
-                "sale_count": {"$ifNull": ["$sale_count", 0]}
-            }},
-            {"$sort": {"sale_count": pymongo.DESCENDING, "created_at": pymongo.DESCENDING}},
-            {"$limit": limit},
-            # FIXED: Corrected lookup using ObjectId conversion
-            {"$lookup": {
-                "from": "shops",
-                "let": {"shop_id": {"$toObjectId": "$shop_id"}},
-                "pipeline": [
-                    {"$match": {
-                        "$expr": {"$eq": ["$_id", "$$shop_id"]}
-                    }}
-                ],
-                "as": "shop_data"
-            }},
-            {"$unwind": {"path": "$shop_data", "preserveNullAndEmptyArrays": True}},
-            {"$project": {
-                "_id": {"$toString": "$_id"},
-                "product_name": 1,
-                "price": 1,
-                "unit": 1,
-                "imageUrl": 1, 
-                "shop_id": 1,
-                "shop_name": "$shop_data.name",  # Consistent naming
-                "shop_latitude": "$shop_data.latitude",
-                "shop_longitude": "$shop_data.longitude",
-                "isOnSale": {"$ifNull": ["$isOnSale", False]},
-                "salePrice": "$salePrice",
-                "saleDescription": "$saleDescription",
-                "saleDaysLeft": {
-                    "$cond": {
-                        "if": {"$and": ["$isOnSale", "$saleEndDate"]},
-                        "then": {
-                            "$max": [0, {"$ceil": {"$divide": [{"$subtract": ["$saleEndDate", datetime.utcnow()]}, 1000 * 60 * 60 * 24]}}]
-                        },
-                        "else": None
-                    }
-                },
-                "location": {
-                    "type": "Point",
-                    "coordinates": ["$shop_data.longitude", "$shop_data.latitude"]
-                },
-                "isOnSale": {"$ifNull": ["$isOnSale", False]},
-                "salePrice": "$salePrice",
-                "saleDescription": "$saleDescription",
-                "distance": {
-                    "$cond": {
-                        "if": {
-                            "$and": [
-                                {"$ne": [user_lat, None]},
-                                {"$ne": [user_lng, None]},
-                                {"$ne": ["$shop_data.latitude", None]},
-                                {"$ne": ["$shop_data.longitude", None]}
-                            ]
-                        },
-                        "then": None,
-                        "else": None
-                    }
-                }
-            }}
         ]
-        trending = list(products_collection.aggregate(pipeline))
-        
-        # FIXED: Unified coordinate handling using extract_shop_coordinates
-        if user_lat and user_lng and \
-           (-90 <= user_lat <= 90) and (-180 <= user_lng <= 180):
-            for product in trending:
-                shop_lat, shop_lng = extract_shop_coordinates(product)
-                if shop_lat is not None and shop_lng is not None:
-                    product['distance'] = haversine(
-                        user_lat, user_lng,
-                        shop_lat,
-                        shop_lng
-                    )
-        
+        trending = list(shops_collection.aggregate(pipeline))
         return {"products": trending}
     except Exception as error:
         print(f"Trending products error: {error}")
         return {"products": []}
 
-# Make same fix for best-price endpoint
+
+# ===== REVISED BEST PRICE PRODUCTS ENDPOINT =====
 @router.get("/products/best-price")
 async def get_best_price_products(
-    user_lat: float = Query(None),
-    user_lng: float = Query(None),
-    limit: int = 6
+    user_lat: float = Query(...),
+    user_lng: float = Query(...),
+    limit: int = 10,
+    skip: int = 0
 ):
     try:
-        if user_lat is None or user_lng is None:
-            print("Location not provided for best-price products search; returning empty list.")
-            return {"products": []}
-        nearby_shops_cursor = shops_collection.find({
-            "location": {
-                "$nearSphere": {
-                    "$geometry": {
-                        "type": "Point",
-                        "coordinates": [user_lng, user_lat]
-                    },
-                    "$maxDistance": 20000
-                }
-            }
-        })
-        nearby_shop_ids = [str(shop["_id"]) for shop in nearby_shops_cursor]
-
-        if not nearby_shop_ids:
-            return {"products": []}
-
         pipeline = [
-            # 1. Match products from nearby shops that are in stock
-            {"$match": {
-                "shop_id": {"$in": nearby_shop_ids},
-                "inStock": True,
-                "isOnSale": {"$ne": True}
-            }},
-
-            # 2. Add sale_count field, defaulting to 0 if it's missing
-            {"$addFields": {
-                "sale_count": {"$ifNull": ["$sale_count", 0]}
-            }},
-
-            # 3. Sort by MOST SOLD first, then by CHEAPEST price as a tie-breaker
-            {"$sort": {
-                "sale_count": pymongo.DESCENDING,
-                "price": pymongo.ASCENDING
-            }},
-
-            # 4. Limit the results to the top items overall
-            {"$limit": limit * 2}, # Fetch a slightly larger pool to ensure variety
-
-            # 5. Group by product name to get the best one for each type
+            {
+                "$geoNear": {
+                    "near": {"type": "Point", "coordinates": [user_lng, user_lat]},
+                    "distanceField": "distance_in_meters",
+                    "maxDistance": 5000, # 5 kilometers
+                    "spherical": True,
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "products",
+                    "let": { "shop_id_str": { "$toString": "$_id" } },
+                    "pipeline": [ { "$match": { "$expr": { "$eq": [ "$shop_id", "$$shop_id_str" ] } } } ],
+                    "as": "products"
+                }
+            },
+            {"$unwind": "$products"},
+            {
+                "$match": {
+                    "products.inStock": True,
+                    "products.isOnSale": {"$ne": True}
+                }
+            },
+            # Preserving your original logic for what "best price" means
+            {"$sort": {"products.sale_count": -1, "products.price": 1}},
             {"$group": {
-                "_id": "$product_name",
+                "_id": "$products.product_name",
                 "best_product": {"$first": "$$ROOT"}
             }},
             {"$replaceRoot": {"newRoot": "$best_product"}},
-
-            # 6. Final limit for display
+            # Now we sort the final list by distance
+            {"$sort": {"distance_in_meters": 1}},
+            {"$skip": skip},
             {"$limit": limit},
-
-            # 7. Add shop data (lookup)
-            {"$lookup": {
-                "from": "shops",
-                "let": {"shop_id": {"$toObjectId": "$shop_id"}},
-                "pipeline": [
-                    {"$match": {
-                        "$expr": {"$eq": ["$_id", "$$shop_id"]}
-                    }}
-                ],
-                "as": "shop_data"
-            }},
-            {"$unwind": {"path": "$shop_data", "preserveNullAndEmptyArrays": True}},
-
-            # 8. Project the final fields for the response
-            {"$project": {
-                "_id": {"$toString": "$_id"},
-                "product_name": 1,
-                "price": 1,
-                "unit": 1,
-                "imageUrl": 1,
-                "shop_id": 1,
-                "shop_name": "$shop_data.name",
-                "shop_latitude": "$shop_data.latitude",
-                "shop_longitude": "$shop_data.longitude",
-                "isOnSale": {"$ifNull": ["$isOnSale", False]},
-                "salePrice": "$salePrice",
-                "saleDescription": "$saleDescription",
-                "saleDaysLeft": {
-                    "$cond": {
-                        "if": {"$and": ["$isOnSale", "$saleEndDate"]},
-                        "then": {
-                            "$max": [0, {"$ceil": {"$divide": [{"$subtract": ["$saleEndDate", datetime.utcnow()]}, 1000 * 60 * 60 * 24]}}]
-                        },
-                        "else": None
-                    }
-                },
-            }}
+            {
+                "$project": {
+                    "_id": {"$toString": "$products._id"},
+                    "product_name": "$products.product_name",
+                    "price": "$products.price",
+                    "unit": "$products.unit",
+                    "imageUrl": "$products.imageUrl",
+                    "shop_id": {"$toString": "$_id"},
+                    "shop_name": "$name",
+                    "distance": {"$divide": ["$distance_in_meters", 1000]},
+                    "isOnSale": "$products.isOnSale",
+                    "salePrice": "$products.salePrice",
+                    "saleDescription": "$products.saleDescription"
+                }
+            }
         ]
-        best_price = list(products_collection.aggregate(pipeline))
-        
-        # FIXED: Unified coordinate handling using extract_shop_coordinates
-        if user_lat and user_lng and \
-           (-90 <= user_lat <= 90) and (-180 <= user_lng <= 180):
-            for product in best_price:
-                shop_lat, shop_lng = extract_shop_coordinates(product)
-                if shop_lat is not None and shop_lng is not None:
-                    product['distance'] = haversine(
-                        user_lat, user_lng,
-                        shop_lat,
-                        shop_lng
-                    )
-        
+        best_price = list(shops_collection.aggregate(pipeline))
         return {"products": best_price}
     except Exception as error:
         print(f"Best price error: {error}")
         return {"products": []}
         
-# ===== UPDATED TRACKING ENDPOINTS =====
+# ===== FIX: Corrected View Recording =====
 @router.post("/record-shop-view/{shop_id}")
 async def record_shop_view(shop_id: str):
     try:
-        # Validate shop ID format
-        if not shop_id or not re.match(r'^[0-9a-fA-F]{24}$', shop_id):
+        if not ObjectId.is_valid(shop_id): # Use is_valid for better checking
             raise HTTPException(
                 status_code=400, 
                 detail="Invalid shop ID"
             )
         
+        # ▼▼▼ ADD THIS LINE ▼▼▼
+        # Convert the incoming string ID to a proper ObjectId
+        shop_id_obj = ObjectId(shop_id)
+        
         # Create view document
         view_data = {
-            "shop_id": shop_id,
+            "shop_id": shop_id_obj, # <-- Use the converted ObjectId here
             "timestamp": datetime.utcnow(),
             "type": "view"
         }
@@ -601,7 +498,7 @@ async def record_shop_view(shop_id: str):
         
         # Immediately update shop's view count
         shops_collection.update_one(
-            {"_id": ObjectId(shop_id)},
+            {"_id": shop_id_obj}, # <-- Also use the ObjectId here
             {"$inc": {"view_count": 1}}
         )
         return {"success": True}

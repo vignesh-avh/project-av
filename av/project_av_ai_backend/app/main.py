@@ -24,11 +24,6 @@ from datetime import datetime, timedelta
 from app.routes.shops import haversine
 from datetime import datetime, timedelta, timezone
 
-import os
-import ssl
-import certifi
-
-os.environ['SSL_CERT_FILE'] = certifi.where()
 
 from fastapi import Form
 import jwt  # Added for token verification
@@ -65,6 +60,13 @@ from bson import ObjectId  # Added for MongoDB ObjectId handling
 from app.clip_model import predict_product_name
 from app.routes.shops import router as shops_router
 
+from pydantic import BaseModel
+from bson import ObjectId
+
+class SaleData(BaseModel):
+    product_id: str
+    shop_id: str
+    quantity: int
 # ADD THIS HELPER FUNCTION
 def safe_object_id(id_str: str):
     try:
@@ -734,109 +736,113 @@ async def update_product(product_id: str, updated_data: dict):
 async def get_deals_products(
     user_lat: float = Query(...),
     user_lng: float = Query(...),
-    limit: int = 10
+    limit: int = 10,
+    skip: int = 0
 ):
     try:
-        # Find shops within a 5km radius
-        nearby_shops_cursor = shops_collection.find({
-            "location": {
-                "$nearSphere": {
-                    "$geometry": {"type": "Point", "coordinates": [user_lng, user_lat]},
-                    "$maxDistance": 20000
+        pipeline = [
+            {
+                "$geoNear": {
+                    "near": {"type": "Point", "coordinates": [user_lng, user_lat]},
+                    "distanceField": "distance_in_meters",
+                    "maxDistance": 5000,  # 5 kilometers
+                    "spherical": True
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "products",
+                    "let": { "shop_id_str": { "$toString": "$_id" } },
+                    "pipeline": [
+                        { "$match": { "$expr": { "$eq": [ "$shop_id", "$$shop_id_str" ] } } }
+                    ],
+                    "as": "products"
+                }
+            },
+            {"$unwind": "$products"},
+            {
+                "$match": {
+                    "products.isOnSale": True,
+                    "products.saleEndDate": {"$gte": datetime.utcnow()}
+                }
+            },
+            # The results are already sorted by distance from $geoNear
+            {"$skip": skip},
+            {"$limit": limit},
+            {
+                "$project": {
+                    "_id": {"$toString": "$products._id"},
+                    "product_name": "$products.product_name",
+                    "price": "$products.price",
+                    "unit": "$products.unit",
+                    "imageUrl": "$products.imageUrl",
+                    "shop_id": {"$toString": "$_id"},
+                    "shop_name": "$name",
+                    "distance": {"$divide": ["$distance_in_meters", 1000]},
+                    "isOnSale": "$products.isOnSale",
+                    "salePrice": "$products.salePrice",
+                    "saleDescription": "$products.saleDescription"
                 }
             }
-        })
-        nearby_shop_ids = [str(shop["_id"]) for shop in nearby_shops_cursor]
-        if not nearby_shop_ids:
-            return {"products": []}
-
-        # Find products that are on sale, not expired, and from those nearby shops
-        pipeline = [
-            {"$match": {
-                "shop_id": {"$in": nearby_shop_ids},
-                "isOnSale": True,
-                "saleEndDate": {"$gte": datetime.utcnow()}
-            }},
-            {"$sort": {"created_at": -1}}, # Using -1 for DESCENDING with pymongo
-            {"$limit": limit},
-            {"$lookup": {
-                "from": "shops",
-                "let": {"shop_id_obj": {"$toObjectId": "$shop_id"}},
-                "pipeline": [{"$match": {"$expr": {"$eq": ["$_id", "$$shop_id_obj"]}}}],
-                "as": "shop_data"
-            }},
-            {"$unwind": "$shop_data"},
-            {"$project": {
-                "_id": {"$toString": "$_id"},
-                "product_name": 1, "price": 1, "unit": 1, "imageUrl": 1,
-                "shop_id": 1, "shop_name": "$shop_data.name",
-                "shop_latitude": "$shop_data.latitude", "shop_longitude": "$shop_data.longitude",
-                "isOnSale": 1, "salePrice": 1, "saleDescription": 1
-            }}
         ]
-        deals = list(products_collection.aggregate(pipeline))
-        
-        # Add distance calculation
-        for product in deals:
-            if product.get("shop_latitude") and product.get("shop_longitude"):
-                product['distance'] = haversine(
-                    user_lat, user_lng,
-                    product["shop_latitude"], product["shop_longitude"]
-                )
-
+        deals = list(shops_collection.aggregate(pipeline))
         return {"products": deals}
     except Exception as error:
         print(f"Deals products error: {error}")
-        return {"products": []}        
+        return {"products": []}
 
-# New endpoint for shops with in_stock filter
+# In main.py, replace the existing get_shops function with this one
+
 @app.get("/get-shops")
 async def get_shops(
     product_name: str = Query(...),
     user_lat: float = Query(...),
     user_lng: float = Query(...),
-    in_stock: bool = Query(True)  # NEW PARAMETER
+    in_stock: bool = Query(True)
 ):
     try:
-        # Find products matching the name
-        query = {
-            "product_name": {"$regex": product_name, "$options": "i"},
-        }
-        
-        # ADD IN-STOCK FILTER
+        # Step 1: Find all products that match the search query.
+        product_query = {"product_name": {"$regex": product_name, "$options": "i"}}
         if in_stock:
-            query["inStock"] = True
+            product_query["inStock"] = True
+        
+        matching_products = list(products_collection.find(product_query))
+        if not matching_products:
+            return {"shops": []}
             
-        matching_products = list(products_collection.find(query))
-        
-        # Get unique shop IDs from matching products
-        shop_ids = list({str(product["shop_id"]) for product in matching_products if "shop_id" in product})
-        
-        # Find shops within 10km radius
-        shops = shops_collection.find({
-            "_id": {"$in": [ObjectId(id) for id in shop_ids]},
-            "location": {
-                "$nearSphere": {
-                    "$geometry": {
-                        "type": "Point",
-                        "coordinates": [user_lng, user_lat]
-                    },
-                    "$maxDistance": 10000  # 10km
+        # Get the unique shop ObjectIDs from the found products.
+        shop_ids_obj = list({ObjectId(p["shop_id"]) for p in matching_products if "shop_id" in p and ObjectId.is_valid(p["shop_id"])})
+
+        # Step 2: Use a $geoNear pipeline on the shops collection.
+        # This finds ALL shops containing the product and sorts them by distance with NO LIMIT.
+        pipeline = [
+            {
+                "$geoNear": {
+                    "near": {"type": "Point", "coordinates": [user_lng, user_lat]},
+                    "distanceField": "distance_in_meters",
+                    "spherical": True,
+                    # This query ensures we only look at shops that are known to have the product.
+                    "query": {"_id": {"$in": shop_ids_obj}}
                 }
             }
-        })
+        ]
         
-        # Format response
+        sorted_shops = list(shops_collection.aggregate(pipeline))
+        
+        # Step 3: Format the response with the correctly sorted shops.
         shop_list = []
-        for shop in shops:
-            # Find products for this shop
-            shop_products = [p for p in matching_products if str(p["shop_id"]) == str(shop["_id"])]
+        for shop in sorted_shops:
+            shop_id_str = str(shop["_id"])
+            
+            # Filter the products from our initial search to only those belonging to this specific shop.
+            shop_products = [p for p in matching_products if p.get("shop_id") == shop_id_str]
             
             shop_list.append({
-                "id": str(shop["_id"]),
+                "id": shop_id_str,
                 "name": shop["name"],
-                "rating": shop["rating"],
-                "store": shop["store"],
+                "rating": shop.get("rating"),
+                "store": shop.get("store"),
+                "distance": shop.get("distance_in_meters", 0) / 1000, # Add distance to the response
                 "products": [{
                     "id": str(p["_id"]),
                     "name": p["product_name"],
@@ -845,7 +851,7 @@ async def get_shops(
                     "inStock": p.get("inStock", True)
                 } for p in shop_products]
             })
-        
+            
         return {"shops": shop_list}
     except Exception as e:
         print(f"Error in get_shops: {str(e)}")
@@ -962,8 +968,6 @@ class UserProfileUpdateRequest(BaseModel):
 @app.post("/update-user-profile")
 async def update_user_profile(request: UserProfileUpdateRequest):
     try:
-        user_obj_id = safe_object_id(request.user_id)
-        
         # Sanitize and validate input
         if len(request.fullName.strip()) == 0:
             raise HTTPException(status_code=400, detail="Full name cannot be empty.")
@@ -975,10 +979,23 @@ async def update_user_profile(request: UserProfileUpdateRequest):
             "city": request.city.strip()
         }
         
+        # ===== START OF FIX =====
+        # This new logic flexibly finds the user by either their
+        # database ObjectId or another unique identifier (like email/uid).
+        user_identifier = request.user_id
+        
+        if ObjectId.is_valid(user_identifier):
+            # If the ID is a valid ObjectId, query by '_id'.
+            query = {"_id": ObjectId(user_identifier)}
+        else:
+            # Otherwise, assume it's a UID (like an email) and query by the 'uid' field.
+            query = {"uid": user_identifier}
+        
         result = users_collection.update_one(
-            {"_id": user_obj_id},
+            query,
             {"$set": update_payload}
         )
+        # ===== END OF FIX =====
 
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="User not found.")
@@ -1462,8 +1479,17 @@ async def check_subscription_status(user_id: str = Query(...)):
 
         if not user.get("next_payment_date"):
             return {"status": "not_subscribed"}
+        # ===== START OF FIX =====
+        # This block ensures that the renewal date is always a proper datetime object,
+        # handling cases where it might be stored as a string (e.g., "2025-10-20").
+        renewal_date_from_db = user["next_payment_date"]
+        if isinstance(renewal_date_from_db, str):
+            # If it's a string, convert it from "YYYY-MM-DD" format to a datetime object.
+            renewal_date = datetime.strptime(renewal_date_from_db, "%Y-%m-%d")
+        else:
+            # If it's not a string, it's already a datetime object.
+            renewal_date = renewal_date_from_db    
 
-        renewal_date = user["next_payment_date"]
         today = datetime.utcnow()
         days_until_renewal = (renewal_date - today).days
 
@@ -1720,7 +1746,8 @@ async def record_view(product_id: str, shop_id: str):
         product_views_collection.insert_one({
             "product_id": product_id,
             "shop_id": shop_id,
-            "timestamp": datetime.utcnow()
+            "timestamp": datetime.utcnow(),
+            "type": "view"
         })
         return {"success": True}
     except Exception as e:
@@ -1867,23 +1894,24 @@ async def record_sale(data: dict):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 @app.post("/record-product-sale")
-async def record_product_sale(sale_data: dict):
+async def record_product_sale(sale_data: SaleData):
     try:
         # Convert string IDs to ObjectIds
-        product_id = ObjectId(sale_data["product_id"])
-        shop_id = ObjectId(sale_data["shop_id"])
-        
+        product_id = ObjectId(sale_data.product_id)
+        shop_id = ObjectId(sale_data.shop_id)
+
         # Update product sale count
         products_collection.update_one(
             {"_id": product_id},
-            {"$inc": {"sale_count": sale_data["quantity"]}}
+            {"$inc": {"sale_count": sale_data.quantity}}
         )
-        
-        # Return success immediately (don't wait for full transaction)
+
+        # Return success immediately
         return {"success": True}
     except Exception as e:
         print(f"Sale recording error: {str(e)}")
         return {"success": False}
+
 
 # ======== ADDED USER LOCATION ENDPOINT BEFORE CATCH-ALL ========
 @app.post("/update-user-location")
