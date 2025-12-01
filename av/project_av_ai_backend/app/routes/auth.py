@@ -1,4 +1,4 @@
-print("--- !!! NEW VERSION OF AUTH.PY  !!! ---") 
+print("--- !!! NEW VERSION OF AUTH.PY IS RUNNING !!! ---") 
 from fastapi import APIRouter, HTTPException, Depends, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
 from jose import jwt
@@ -21,8 +21,6 @@ from fastapi import Header
 from bson import ObjectId   # 🔧 ADD THIS IMPORT REQUIRED FOR refresh-token
 from app.utils.security import create_access_token # Ensure this function is imported
 import logging # Recommended for logging
-from bson import datetime as bson_datetime
-
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -74,19 +72,21 @@ class UserLoginRequest(BaseModel):
     password: str
 
 @router.post("/signup")
-async def signup(user: User, background_tasks: BackgroundTasks):
+async def signup(user: User, background_tasks: BackgroundTasks): # <-- Add BackgroundTasks
     existing_user = users_collection.find_one({"email": user.email})
     
     if existing_user and existing_user.get("is_verified"):
         raise HTTPException(status_code=400, detail="Email already registered") 
 
+    # Generate a 6-digit OTP
     otp = str(random.randint(100000, 999999))
-    # Use the correct datetime object
-    otp_expires_at = bson_datetime.datetime.utcnow() + timedelta(minutes=10)
+    otp_expires_at = datetime.utcnow() + timedelta(minutes=10) # 10-minute expiry
 
+    # Send OTP email in the background
     background_tasks.add_task(send_otp_email, user.email, otp)
     
     if existing_user:
+        # User exists but is not verified, update their OTP
         users_collection.update_one(
             {"email": user.email},
             {"$set": {
@@ -95,10 +95,11 @@ async def signup(user: User, background_tasks: BackgroundTasks):
                 "city": user.city,
                 "email_otp": otp,
                 "otp_expires_at": otp_expires_at,
-                "created_at": bson_datetime.datetime.utcnow() 
+                "created_at": datetime.utcnow()
             }}
         )
     else:
+        # New user, create their record
         user_data = {
             "email": user.email,
             "fullName": user.fullName,
@@ -106,22 +107,27 @@ async def signup(user: User, background_tasks: BackgroundTasks):
             "role": user.role,
             "password_hash": get_password_hash(user.password),
             "referral_code": ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6)),
-            "created_at": bson_datetime.datetime.utcnow(), # Use the correct datetime
+            "created_at": datetime.utcnow(),
             "uid": user.email.replace(' ', '_').lower(),
+            # --- Set verification fields ---
             "is_verified": False,
             "email_otp": otp,
             "otp_expires_at": otp_expires_at,
+            # --- Default other fields ---
             "referral_count": 0,
             "referral_earnings": 0,
             "coins": 0,
             "wallet_balance": 0,
             "onboarding_done": False,
             "hasEnteredReferral": False,
+            "fcm_tokens": []
         }
         users_collection.insert_one(user_data)
         
     return {"message": "OTP has been sent to your email."}
 
+
+# === ADD THIS NEW VERIFY OTP ENDPOINT ===
 class OtpVerificationRequest(BaseModel):
     email: str
     otp: str
@@ -136,23 +142,25 @@ async def verify_otp(request: OtpVerificationRequest):
     if user.get("is_verified"):
         raise HTTPException(status_code=400, detail="Account already verified.")
 
-    # This comparison now works because otp_expires_at is stored as a proper date
     if user.get("otp_expires_at") < datetime.utcnow():
         raise HTTPException(status_code=400, detail="OTP has expired.")
     
     if user.get("email_otp") != request.otp:
         raise HTTPException(status_code=400, detail="Invalid OTP.")
 
-    # Use the correct datetime object for the payment date
-    next_payment = bson_datetime.datetime.utcnow() + timedelta(days=30)
+    # Verification successful, update the user
+    next_payment = datetime.utcnow() + timedelta(days=30)
     
+    # Verification successful, update the user
     users_collection.update_one(
         {"email": request.email},
         {
+            # Add next_payment_date to the $set operation
             "$set": {"is_verified": True, "next_payment_date": next_payment},
             "$unset": {"email_otp": "", "otp_expires_at": ""}
         }
     )
+    # Log the user in by creating an access token
     access_token = create_access_token(
         data={
             "sub": str(user["_id"]),
@@ -165,6 +173,8 @@ async def verify_otp(request: OtpVerificationRequest):
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
+
+# === MODIFIED LOGIN ENDPOINT ===
 @router.post("/login")
 async def login(credentials: UserLoginRequest):
     user = users_collection.find_one({"email": credentials.email})
@@ -175,8 +185,11 @@ async def login(credentials: UserLoginRequest):
             detail="Incorrect email or password",
         )
     
+    # --- ADD THIS CHECK ---
     if not user.get("is_verified"):
+        # You could optionally resend the OTP here if you want
         raise HTTPException(status_code=403, detail="Account not verified. Please check your email for an OTP.")
+    # ----------------------
 
     access_token = create_access_token(
         data={
@@ -189,8 +202,9 @@ async def login(credentials: UserLoginRequest):
         }
     ) 
     
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {"access_token": access_token, "token_type": "bearer"} 
 
+# UPDATED Google auth endpoint as requested
 @router.post("/google-auth")
 async def google_auth(request: GoogleAuthRequest):
     try:
@@ -201,21 +215,24 @@ async def google_auth(request: GoogleAuthRequest):
         user = users_collection.find_one({"email": user_info.email})
         
         if user:
+            # FIX: Validate role consistency
             if request.role and user["role"] != request.role:
                 raise HTTPException(
                     status_code=403,
                     detail="Account exists with different role"
                 )
             
+            # FIXED: Include has_entered_referral in token with consistent naming
             access_token = create_access_token({
                 "sub": str(user["_id"]),
                 "role": user["role"],
                 "onboarding_done": user.get("onboarding_done", False),
                 "has_entered_referral": user.get("hasEnteredReferral", False),
-                "uid": str(user["_id"])
+                "uid": str(user["_id"])  # Consistent uid claim
             })
             return {"access_token": access_token, "token_type": "bearer"}
         
+        # New user - create with requested role
         referral_code = await generate_referral_code()
         new_user_data = {
             "email": user_info.email,
@@ -229,21 +246,21 @@ async def google_auth(request: GoogleAuthRequest):
             "coins": 0,
             "wallet_balance": 0,
             "onboarding_done": False,
-            "hasEnteredReferral": False,
-            # Use the correct datetime object
-            "created_at": bson_datetime.datetime.utcnow(),
-            "next_payment_date": bson_datetime.datetime.utcnow() + timedelta(days=30),
+            "hasEnteredReferral": False,  # Initialize as False
+            "created_at": datetime.utcnow(),
+            "next_payment_date": datetime.utcnow() + timedelta(days=30),
             "uid": user_info.email.replace(' ', '_').lower() if user_info.email else str(uuid.uuid4())
         }
         
         result = users_collection.insert_one(new_user_data)
         
+        # FIXED: Consistent naming and added uid
         access_token = create_access_token({
             "sub": str(result.inserted_id),
             "role": request.role,
             "onboarding_done": False,
-            "has_entered_referral": False,
-            "uid": str(result.inserted_id)
+            "has_entered_referral": False,  # Consistent naming
+            "uid": str(result.inserted_id)  # Added uid claim
         })
         return {"access_token": access_token, "token_type": "bearer"}
         

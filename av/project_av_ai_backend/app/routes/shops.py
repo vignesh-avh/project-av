@@ -207,10 +207,12 @@ async def get_shop(id: str = Query(...)):
                             "price": "$$prod.price",
                             "unit": "$$prod.unit",
                             "count": "$$prod.count",
+                            "category": "$$prod.category",
                             "imageUrl": "$$prod.imageUrl",
                             "isOnSale": {"$ifNull": ["$$prod.isOnSale", False]},
                             "salePrice": "$$prod.salePrice",
                             "saleDescription": "$$prod.saleDescription",
+                            "saleEndDate": "$$prod.saleEndDate",
                             "saleDaysLeft": {
                                 "$cond": {
                                     "if": {"$and": ["$$prod.isOnSale", "$$prod.saleEndDate"]},
@@ -304,7 +306,6 @@ async def get_shop_performance(owner_id: str, days: int = 7):
         ]
         views_data = list(product_views_collection.aggregate(views_pipeline))
         
-        print(f"--- DEBUG: Raw views data from DB for shop {shop_id}: {views_data} ---")
         # Populate map with the fetched data
         for item in sales_data:
             if item["date"] in performance_map:
@@ -317,7 +318,6 @@ async def get_shop_performance(owner_id: str, days: int = 7):
         # Sort the data chronologically
         performance_data = sorted(performance_map.values(), key=lambda x: x["date"])
         
-        print(f"--- DEBUG: Final performance data sent to frontend: {performance_data} ---")
         return {"performance": performance_data}
     except Exception as e:
         print(f"Performance error: {str(e)}")

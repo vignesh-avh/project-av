@@ -1,3 +1,8 @@
+import logging
+
+# Configure logging to show APScheduler messages
+logging.basicConfig()
+logging.getLogger('apscheduler').setLevel(logging.DEBUG)
 from fastapi import FastAPI, File, UploadFile, Query, HTTPException, Request, Header, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,8 +57,28 @@ import razorpay
 import hmac
 import hashlib
 
+import aiofiles
+import aiofiles.os
+import uuid
+import os
+from io import BytesIO
+from .clip_model import predict_product_name
+
 from html import escape
 from bson import ObjectId  # Added for MongoDB ObjectId handling
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from app.notifications import ( # Import your new notification functions
+    send_owner_morning_reminder,
+    send_owner_evening_stats,
+    send_owner_night_stock_reminder,
+    send_customer_morning_essentials,
+    send_customer_deals_reminder,
+    send_subscription_reminders
+    # Add other customer functions here later
+)
+from pydantic import BaseModel # Ensure this is imported
 
 # Removed Firebase imports and initialization
 
@@ -62,6 +87,15 @@ from app.routes.shops import router as shops_router
 
 from pydantic import BaseModel
 from bson import ObjectId
+
+# In main.py (near the top, after imports)
+import logging
+logger = logging.getLogger("uvicorn.error") # Make sure logger is defined
+
+def simple_test_job():
+    logger.info("!!!!!!!!!!!!!! APSCHEDULER TEST JOB IS RUNNING !!!!!!!!!!!!!!")
+
+TEMP_UPLOAD_DIR = "temp_uploads"
 
 class SaleData(BaseModel):
     product_id: str
@@ -218,6 +252,27 @@ def startup_db_client():
     product_sales_collection = db["product_sales"]
     
     print("✅ Connected to MongoDB with payments collection")  # Updated message
+    if not os.path.exists(TEMP_UPLOAD_DIR):
+        os.makedirs(TEMP_UPLOAD_DIR)
+    print(f"✅ Temporary upload directory '{TEMP_UPLOAD_DIR}' is ready.")
+
+    global scheduler # Make scheduler accessible globally if needed elsewhere
+    scheduler = AsyncIOScheduler(timezone="Asia/Kolkata") # Use Indian Standard Time
+
+    # Owner Notifications
+    scheduler.add_job(send_owner_morning_reminder, CronTrigger(hour=7, minute=0)) # 7:00 AM IST
+    scheduler.add_job(send_owner_evening_stats, CronTrigger(hour=19, minute=30)) # 7:30 PM IST
+    scheduler.add_job(send_owner_night_stock_reminder, CronTrigger(hour=22, minute=0)) # 10:00 PM IST
+
+    # Customer Notifications (Examples)
+    scheduler.add_job(send_customer_morning_essentials, CronTrigger(hour=8, minute=0)) # 8:00 AM IST
+    scheduler.add_job(send_customer_deals_reminder, CronTrigger(hour=17, minute=20)) # 5:00 PM IST
+    # Add more customer jobs here (afternoon, night etc.)
+    scheduler.add_job(send_subscription_reminders, CronTrigger(hour=9, minute=0))
+
+    scheduler.start()
+    print(f"✅ Notification scheduler started with {len(scheduler.get_jobs())} jobs.")
+    # --- END SCHEDULER SETUP ---
 
     try:
         cloudinary.config(
@@ -239,6 +294,12 @@ def check_mongodb_connection():
         return False
     except Exception:
         return False
+
+@app.on_event("shutdown")
+async def shutdown_scheduler():
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+        logger.info("Notification scheduler shut down.")        
 
 # Health check endpoint
 @app.get("/health")
@@ -272,58 +333,157 @@ async def verify_token(authorization: str = Header(None)):
     except Exception as e:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-@app.post("/predict/")
-async def predict(file: UploadFile = File(...)):
+# IN: main.py
+
+class FcmTokenRequest(BaseModel):
+    user_id: str
+    token: str # The FCM token from the app
+
+@app.post("/register-fcm-token")
+async def register_fcm_token(request: FcmTokenRequest):
+    """Receives FCM token from the app and saves/updates it for the user."""
+    try:
+        # Use safe_object_id to handle potential invalid user_id format
+        user_obj_id = safe_object_id(request.user_id)
+
+        # Use $addToSet to add the token only if it's not already in the list
+        # Use upsert=True to create the user document if it doesn't exist (e.g., first login)
+        # though ideally user creation happens at signup/login.
+        result = users_collection.update_one(
+            {"_id": user_obj_id},
+            {"$addToSet": {"fcm_tokens": request.token}},
+            upsert=False # Set to True ONLY if you want to create user here
+        )
+
+        if result.matched_count == 0 and result.upserted_id is None:
+             logger.warning(f"FCM Token Registration: User not found for ID {request.user_id}. Token not saved.")
+             # Decide if you want to raise an HTTPException or just log
+             # raise HTTPException(status_code=404, detail="User not found")
+             return {"success": False, "message": "User not found"}
+
+        logger.info(f"Registered/Updated FCM token for user {request.user_id}")
+        return {"success": True}
+    except HTTPException as he:
+        raise he # Re-raise HTTP exceptions
+    except Exception as e:
+        logger.error(f"Error registering FCM token for user {request.user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not register FCM token.")
+
+@app.post("/upload-and-predict/")
+async def upload_and_predict(file: UploadFile = File(...)):
+    """
+    Uploads an image, saves it temporarily, and runs prediction.
+    Returns the predicted name and a temporary ID for the saved file.
+    """
     try:
         if file.content_type not in ["image/jpeg", "image/png"]:
             raise HTTPException(status_code=400, detail="Invalid file type")
         
         contents = await file.read()
-        if len(contents) > 5 * 1024 * 1024:
+        if len(contents) > 5 * 1024 * 1024: # 5MB limit
             raise HTTPException(status_code=400, detail="File too large")
         
+        # 1. Run prediction from memory
         img = Image.open(BytesIO(contents))
-        result = predict_product_name(img)
-        return {"product_name": result}
+        predicted_name = predict_product_name(img)
+        
+        # 2. Save file temporarily with a unique name
+        # Get file extension (e.g., .jpg)
+        file_extension = os.path.splitext(file.filename)[1] 
+        temp_image_id = f"{uuid.uuid4()}{file_extension}"
+        temp_file_path = os.path.join(TEMP_UPLOAD_DIR, temp_image_id)
+        
+        async with aiofiles.open(temp_file_path, "wb") as out_file:
+            await out_file.write(contents)
+        
+        # 3. Return both results to the app
+        return {"predicted_name": predicted_name, "temp_image_id": temp_image_id}
+    
     except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        logger.error(f"Error in /upload-and-predict: {traceback.format_exc()}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-
-@app.post("/add-product/")
-async def add_product(
-    product_name: str = Form(...),
-    price: float = Form(...),
-    unit: str = Form(...),
-    owner_id: str = Form(...),
-    count: int = Form(...),
-    file: UploadFile = File(...)
-):
+# HELPER FUNCTION FOR BACKGROUND IMAGE UPLOAD
+async def upload_image_and_update_db(temp_image_id: str, product_id: ObjectId): # <-- ARGUMENTS CHANGED
+    """
+    This function runs in the background AFTER the user gets a "success" response.
+    It uploads the image from the temp folder to Cloudinary, updates MongoDB,
+    and then deletes the temp file.
+    """
+    temp_file_path = os.path.join(TEMP_UPLOAD_DIR, temp_image_id)
     try:
-        # Step 1: Upload the original image without any transformation parameters.
+        if not os.path.exists(temp_file_path):
+            logger.error(f"BG Upload Failed: Temp file {temp_file_path} not found for product {product_id}.")
+            products_collection.update_one({"_id": product_id},{"$set": {"status": "upload_failed"}})
+            return
+
+        # 1. Upload the image file from the path (the slow part)
         upload_result = cloudinary.uploader.upload(
-            file.file,
+            temp_file_path, # <-- CHANGED: Upload from file path
             folder="project_av_products"
         )
         
         public_id = upload_result.get("public_id")
         
         if not public_id:
-            raise HTTPException(status_code=500, detail="Image upload failed, public_id not found.")
+            logger.error(f"BG Upload Failed: Image upload failed for product {product_id}, public_id not found.")
+            products_collection.update_one({"_id": product_id},{"$set": {"status": "upload_failed"}})
+            return
 
-        # --- FINAL FIX ---
-        # Manually construct the URL to include the on-the-fly background removal
-        # transformation ('e_background_removal'). This ensures the correct version is always served.
-        # NOTE: The cloud name 'dwg7jqdq7' is taken from your dashboard details.
+        # 2. Construct the final URL with background removal
         image_url = f"https://res.cloudinary.com/dwg7jqdq7/image/upload/e_background_removal/{public_id}.jpg"
         
-        # Step 2: Save the product to the database with the correctly transformed URL.
+        # 3. Update the product record in MongoDB with the final URL
+        products_collection.update_one(
+            {"_id": product_id},
+            {"$set": {
+                "imageUrl": image_url,
+                "status": "visible" # Mark as ready
+            }}
+        )
+        logger.info(f"BG Upload Success: Successfully processed image for product {product_id}")
+    
+    except Exception as e:
+        logger.error(f"BG Upload Failed: Background image upload failed for product {product_id}: {traceback.format_exc()}")
+        # Mark the product as failed so it can be fixed later
+        products_collection.update_one(
+            {"_id": product_id},
+            {"$set": {"status": "upload_failed"}}
+        )
+    
+    finally:
+        # --- 4. IMPORTANT: CLEAN UP THE TEMP FILE ---
+        if os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+                logger.info(f"BG Cleanup: Removed temp file {temp_file_path}")
+            except Exception as e:
+                logger.error(f"BG Cleanup Failed: Could not remove {temp_file_path}: {e}")
+
+@app.post("/add-product/")
+async def add_product(
+    background_tasks: BackgroundTasks, # <-- This is still needed
+    product_name: str = Form(...),
+    price: float = Form(...),
+    unit: str = Form(...),
+    owner_id: str = Form(...),
+    count: int = Form(...),
+    temp_image_id: str = Form(...),
+    category: str = Form(...)
+):
+    try:
+        # --- THE FILE READ IS GONE, MAKING THIS STEP FAST ---
+
+        # --- 3. SAVE TEXT DATA TO DB FIRST (This is fast) ---
         product_dict = {
             "product_name": sanitize_input(product_name),
             "price": price,
             "unit": unit,
             "owner_id": owner_id,
             "count": count,
-            "imageUrl": image_url, # This is now the correctly transformed URL
+            "category": category,
+            "imageUrl": None, # Placeholder
+            "status": "processing_image", # New status field
             "inStock": True,
             "created_at": datetime.utcnow()
         }
@@ -333,15 +493,23 @@ async def add_product(
             product_dict["shop_id"] = str(shop["_id"])
         
         result = products_collection.insert_one(product_dict)
-        product_id = str(result.inserted_id)
+        product_id = result.inserted_id # Get the new product's ObjectId
+        product_id_str = str(product_id)
         
+        # --- 4. ADD THE SLOW UPLOAD TO THE BACKGROUND ---
+        # We now pass the temp_image_id, not the file data
+        background_tasks.add_task(upload_image_and_update_db, temp_image_id, product_id)
+        
+        # --- 5. RETURN SUCCESS TO THE APP IMMEDIATELY ---
+        # The app gets this response in <1 second
         return {
             "message": "Product added successfully",
-            "product_id": product_id,
-            "product": {**product_dict, "_id": product_id}
+            "product_id": product_id_str,
+            # Send the saved data back to the app
+            "product": {**product_dict, "_id": product_id_str, "created_at": product_dict["created_at"].isoformat()}
         }
     except Exception as e:
-        logger.error(f"Error adding product: {traceback.format_exc()}")
+        logger.error(f"Error adding product (sync part): {traceback.format_exc()}")
         return JSONResponse(status_code=500, content={"error": f"Failed to add product: {str(e)}"})
 
 @app.get("/get-products/")
@@ -700,6 +868,9 @@ async def update_product(product_id: str, updated_data: dict):
 
         if "unit" in updated_data:
             update_payload["unit"] = updated_data["unit"]
+
+        if "category" in updated_data: # <--- ADD THIS BLOCK
+            update_payload["category"] = updated_data["category"]
             
         if "inStock" in updated_data:
             update_payload["inStock"] = bool(updated_data["inStock"])
@@ -1539,6 +1710,9 @@ async def owner_check_subscription(owner_id: str = Query(...)):
 
         if days_left < 0:
             return {"status": "expired"}
+
+        if days_left <= 1: # If 1 day left OR 0 days left (same day)
+           return {"status": "final_warning"}    
 
         if days_left <= 10:
             # Add 1 to days_left so it says "in 1 day" instead of "in 0 days"
