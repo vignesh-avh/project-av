@@ -397,7 +397,9 @@ async def get_trending_products(
                     "distance": {"$divide": ["$distance_in_meters", 1000]},
                     "isOnSale": "$products.isOnSale",
                     "salePrice": "$products.salePrice",
-                    "saleDescription": "$products.saleDescription"
+                    "saleDescription": "$products.saleDescription",
+                    # --- NEW: Project real sold count for frontend ---
+                    "sold_count": {"$ifNull": ["$products.sale_count", 0]} 
                 }
             }
         ]
@@ -408,7 +410,7 @@ async def get_trending_products(
         return {"products": []}
 
 
-# ===== REVISED BEST PRICE PRODUCTS ENDPOINT =====
+# ===== REVISED BEST PRICE ENDPOINT WITH DYNAMIC TAGLINES =====
 @router.get("/products/best-price")
 async def get_best_price_products(
     user_lat: float = Query(...),
@@ -441,14 +443,12 @@ async def get_best_price_products(
                     "products.isOnSale": {"$ne": True}
                 }
             },
-            # Preserving your original logic for what "best price" means
             {"$sort": {"products.sale_count": -1, "products.price": 1}},
             {"$group": {
                 "_id": "$products.product_name",
                 "best_product": {"$first": "$$ROOT"}
             }},
             {"$replaceRoot": {"newRoot": "$best_product"}},
-            # Now we sort the final list by distance
             {"$sort": {"distance_in_meters": 1}},
             {"$skip": skip},
             {"$limit": limit},
@@ -469,7 +469,29 @@ async def get_best_price_products(
             }
         ]
         best_price = list(shops_collection.aggregate(pipeline))
+
+        # --- NEW: Add Dynamic Energetic Taglines ---
+        # List of energetic phrases
+        marketing_phrases = [
+            "Cheaper than before!",
+            "Lowest price nearby!",
+            "Price Drop Alert!",
+            "Unbeatable Value!",
+            "Super Saver Deal!",
+            "Less price than others!",
+            "Market Best Rate!",
+            "Huge Savings Today!"
+        ]
+
+        # Assign a phrase to each product based on its name length (deterministic but looks random)
+        for i, product in enumerate(best_price):
+            # Calculate an index to pick a phrase
+            # We use product name length + index to ensure variety
+            phrase_index = (len(product.get("product_name", "")) + i) % len(marketing_phrases)
+            product["marketing_tagline"] = marketing_phrases[phrase_index]
+
         return {"products": best_price}
+        
     except Exception as error:
         print(f"Best price error: {error}")
         return {"products": []}
