@@ -346,17 +346,94 @@ async def get_top_products(owner_id: str, limit: int = 3):
         print(f"Top products error: {str(e)}")
         return {"products": []}
 
-# ===== FIXED TRENDING PRODUCTS ENDPOINT =====
+# ===== EXTENDED DEALS ENDPOINT WITH CATEGORY FILTER =====
+@router.get("/products/deals-extended")
+async def get_extended_deals(
+    user_lat: float = Query(...),
+    user_lng: float = Query(...),
+    limit: int = 10,
+    skip: int = 0,
+    category: str = Query(None) # Added category param
+):
+    try:
+        # Dynamic Match
+        match_query = {
+            "products.isOnSale": True,
+            "products.saleEndDate": {"$gte": datetime.utcnow()}
+        }
+        if category and category != "All":
+            match_query["products.category"] = category
 
-# FIXED: Unified location handling in product endpoints
+        pipeline = [
+            {
+                "$geoNear": {
+                    "near": {"type": "Point", "coordinates": [user_lng, user_lat]},
+                    "distanceField": "distance_in_meters",
+                    "minDistance": 5000, 
+                    "maxDistance": 50000,
+                    "spherical": True
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "products",
+                    "let": { "shop_id_str": { "$toString": "$_id" } },
+                    "pipeline": [
+                        { "$match": { "$expr": { "$eq": [ "$shop_id", "$$shop_id_str" ] } } }
+                    ],
+                    "as": "products"
+                }
+            },
+            {"$unwind": "$products"},
+            {"$match": match_query}, # Applied dynamic match
+            # Sort by Popularity (Sale count) first, then Distance
+            {"$sort": {"products.sale_count": -1, "distance_in_meters": 1}},
+            {"$skip": skip},
+            {"$limit": limit},
+            {
+                "$project": {
+                    "_id": {"$toString": "$products._id"},
+                    "product_name": "$products.product_name",
+                    "price": "$products.price",
+                    "unit": "$products.unit",
+                    "imageUrl": "$products.imageUrl",
+                    "category": "$products.category", # Return category
+                    "shop_id": {"$toString": "$_id"},
+                    "shop_name": "$name",
+                    "distance": {"$divide": ["$distance_in_meters", 1000]},
+                    "isOnSale": "$products.isOnSale",
+                    "salePrice": "$products.salePrice",
+                    "saleDescription": "$products.saleDescription",
+                    # --- NEW: Project real sold count for frontend ---
+                    "sold_count": {"$ifNull": ["$products.sale_count", 0]},
+                    "marketing_tagline": "Worth the drive!"
+                }
+            }
+        ]
+        deals = list(shops_collection.aggregate(pipeline))
+        return {"products": deals}
+    except Exception as error:
+        print(f"Extended deals error: {error}")
+        return {"products": []}
+
+# ===== FIXED TRENDING PRODUCTS ENDPOINT WITH CATEGORY FILTER =====
 @router.get("/products/trending")
 async def get_trending_products(
     user_lat: float = Query(...),
     user_lng: float = Query(...),
     limit: int = 10,
-    skip: int = 0
+    skip: int = 0,
+    category: str = Query(None) # Added category param
 ):
     try:
+        # Dynamic Match
+        match_query = {
+            "products.inStock": True,
+            "products.isOnSale": {"$ne": True}
+        }
+        if category and category != "All":
+            match_query["products.category"] = category
+
         pipeline = [
             {
                 "$geoNear": {
@@ -375,12 +452,7 @@ async def get_trending_products(
                 }
             },
             {"$unwind": "$products"},
-            {
-                "$match": {
-                    "products.inStock": True,
-                    "products.isOnSale": {"$ne": True}
-                }
-            },
+            {"$match": match_query}, # Applied dynamic match
             # Sort by MOST SOLD first, then by distance
             {"$sort": {"products.sale_count": -1, "distance_in_meters": 1}},
             {"$skip": skip},
@@ -392,6 +464,7 @@ async def get_trending_products(
                     "price": "$products.price",
                     "unit": "$products.unit",
                     "imageUrl": "$products.imageUrl",
+                    "category": "$products.category", # Return category
                     "shop_id": {"$toString": "$_id"},
                     "shop_name": "$name",
                     "distance": {"$divide": ["$distance_in_meters", 1000]},
@@ -410,15 +483,24 @@ async def get_trending_products(
         return {"products": []}
 
 
-# ===== REVISED BEST PRICE ENDPOINT WITH DYNAMIC TAGLINES =====
+# ===== REVISED BEST PRICE ENDPOINT WITH CATEGORY FILTER =====
 @router.get("/products/best-price")
 async def get_best_price_products(
     user_lat: float = Query(...),
     user_lng: float = Query(...),
     limit: int = 10,
-    skip: int = 0
+    skip: int = 0,
+    category: str = Query(None) # Added category param
 ):
     try:
+        # Dynamic Match
+        match_query = {
+            "products.inStock": True,
+            "products.isOnSale": {"$ne": True}
+        }
+        if category and category != "All":
+            match_query["products.category"] = category
+
         pipeline = [
             {
                 "$geoNear": {
@@ -437,12 +519,7 @@ async def get_best_price_products(
                 }
             },
             {"$unwind": "$products"},
-            {
-                "$match": {
-                    "products.inStock": True,
-                    "products.isOnSale": {"$ne": True}
-                }
-            },
+            {"$match": match_query}, # Applied dynamic match
             {"$sort": {"products.sale_count": -1, "products.price": 1}},
             {"$group": {
                 "_id": "$products.product_name",
@@ -459,6 +536,7 @@ async def get_best_price_products(
                     "price": "$products.price",
                     "unit": "$products.unit",
                     "imageUrl": "$products.imageUrl",
+                    "category": "$products.category", # Return category
                     "shop_id": {"$toString": "$_id"},
                     "shop_name": "$name",
                     "distance": {"$divide": ["$distance_in_meters", 1000]},

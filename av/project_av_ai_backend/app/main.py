@@ -908,15 +908,25 @@ async def get_deals_products(
     user_lat: float = Query(...),
     user_lng: float = Query(...),
     limit: int = 10,
-    skip: int = 0
+    skip: int = 0,
+    category: str = Query(None) # 1. Accept Category
 ):
     try:
+        # 2. Dynamic Match Stage
+        match_stage = {
+            "products.isOnSale": True,
+            "products.saleEndDate": {"$gte": datetime.utcnow()}
+        }
+        
+        if category and category != "All":
+            match_stage["products.category"] = category
+
         pipeline = [
             {
                 "$geoNear": {
                     "near": {"type": "Point", "coordinates": [user_lng, user_lat]},
                     "distanceField": "distance_in_meters",
-                    "maxDistance": 5000,  # 5 kilometers
+                    "maxDistance": 5000, 
                     "spherical": True
                 }
             },
@@ -931,13 +941,7 @@ async def get_deals_products(
                 }
             },
             {"$unwind": "$products"},
-            {
-                "$match": {
-                    "products.isOnSale": True,
-                    "products.saleEndDate": {"$gte": datetime.utcnow()}
-                }
-            },
-            # The results are already sorted by distance from $geoNear
+            {"$match": match_stage}, # 3. Apply Filter
             {"$skip": skip},
             {"$limit": limit},
             {
@@ -946,6 +950,7 @@ async def get_deals_products(
                     "product_name": "$products.product_name",
                     "price": "$products.price",
                     "unit": "$products.unit",
+                    "category": "$products.category", # 4. Return Category
                     "imageUrl": "$products.imageUrl",
                     "shop_id": {"$toString": "$_id"},
                     "shop_name": "$name",
@@ -962,8 +967,7 @@ async def get_deals_products(
         print(f"Deals products error: {error}")
         return {"products": []}
 
-# In main.py, replace the existing get_shops function with this one
-
+        
 @app.get("/get-shops")
 async def get_shops(
     product_name: str = Query(...),
@@ -1222,25 +1226,35 @@ async def update_shop_location(request: ShopLocationUpdateRequest):
 async def get_user(user_id: str = Query(...)):
     try:
         from bson import ObjectId
-        # Try both uid and email fields
         user = None
         
-        # First try as ObjectId
-        try:
+        # Try finding user
+        if ObjectId.is_valid(user_id):
             user = users_collection.find_one({"_id": ObjectId(user_id)})
-        except:
-            pass
-        
-        # Then try as email
         if not user:
             user = users_collection.find_one({"email": user_id})
-            
-        # Then try as uid
         if not user:
             user = users_collection.find_one({"uid": user_id})
             
         if user:
-            # Convert ObjectId to string
+            # --- CRITICAL FIX: Calculate Active Coins Dynamically ---
+            # This ensures the Home Screen shows the same balance as Subscription screen
+            # and hides expired coins completely.
+            user_db_id = str(user["_id"])
+            
+            # Re-using the logic from get_user_coins to ensure consistency
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=45)
+            query = {
+                "user_id": {"$in": [user_db_id, user.get("uid")]},
+                "$or": [
+                    {"created_at": {"$gte": cutoff_date}},
+                    {"timestamp": {"$gte": cutoff_date}}
+                ]
+            }
+            recent_transactions = list(rewards_collection.find(query))
+            active_coins = sum(t.get("coins", 0) for t in recent_transactions)
+            # -------------------------------------------------------
+
             if '_id' in user:
                 user['_id'] = str(user['_id'])
                 
@@ -1253,10 +1267,10 @@ async def get_user(user_id: str = Query(...)):
                 "referral_code": user.get("referral_code", ""),
                 "referral_count": user.get("referral_count", 0),
                 "referral_earnings": user.get("referral_earnings", 0),
-                "coins": float(user.get("coins", 0)),
+                "coins": float(active_coins), # FIXED: Returns calculated ACTIVE coins only
                 "onboarding_done": user.get("onboarding_done", False),
                 "hasEnteredReferral": user.get("hasEnteredReferral", False),
-                "uid": user.get("uid", user.get("email", ""))  # Use email as fallback
+                "uid": user.get("uid", user.get("email", ""))
             }
         return JSONResponse(
             status_code=404,
@@ -1787,7 +1801,7 @@ async def get_user_coins(user_id: str):
         # Query for transactions
         user_id_query = {"$in": [user_db_id_str, user_uid] if user_uid else [user_db_id_str]}
         
-        cutoff_date = datetime.now(timezone.utc) - timedelta(days=90)
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=45)
         query = {
             "user_id": user_id_query,
             "$or": [
