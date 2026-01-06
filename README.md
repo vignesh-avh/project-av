@@ -16,9 +16,9 @@ This is not a delivery app.
 - Database: MongoDB
 
 ## Current State
-- Android app foundation is built
-- Backend APIs are in place
-- Core flows exist and are working
+- Android app foundation is built (80% done)
+- Backend APIs are in place (80% done)
+- Core flows exist and are working (80% done)
 - Development reached a point where moving alone will slow things down
 
 AI tools were used to speed up development where useful,
