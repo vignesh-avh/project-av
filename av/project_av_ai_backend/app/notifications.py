@@ -1,5 +1,3 @@
-# IN: notifications.py (NEW FILE)
-
 import firebase_admin
 from firebase_admin import credentials, messaging
 from app.db import users_collection, shops_collection, products_collection, product_views_collection
@@ -121,7 +119,7 @@ async def send_fcm_notification(tokens: list, title: str, body: str, data: dict 
                             errors_logged.append(f"Token [{failed_token[:10]}...] marked for removal: {type(error).__name__}")
                         else:
                             # Log other types of errors without removing the token
-                             errors_logged.append(f"Token [{failed_token[:10]}...] failed (will not remove): {error}")
+                            errors_logged.append(f"Token [{failed_token[:10]}...] failed (will not remove): {error}")
 
             if errors_logged:
                 logger.warning(f"Failed FCM sends ({failure_count} total): {errors_logged}")
@@ -485,3 +483,96 @@ async def send_subscription_reminders():
 
     except Exception as e:
         logger.error(f"Error in send_subscription_reminders: {e}", exc_info=True)
+
+async def send_owner_availability_request(owner_id: str, product_name: str, product_image: str, product_id: str):
+    """
+    Sends a HIGH PRIORITY notification to the owner asking about stock.
+    Includes custom sound payload.
+    """
+    try:
+        owner = users_collection.find_one({"_id": ObjectId(owner_id)}) # Assuming owner_id is passed as ID string or we fix lookup
+        if not owner:
+            # Fallback: try looking up by uid if _id failed (legacy support)
+            owner = users_collection.find_one({"uid": owner_id})
+            
+        if not owner:
+            logger.warning(f"Owner not found for availability request: {owner_id}")
+            return
+
+        tokens = owner.get("fcm_tokens", [])
+        if not tokens: return
+
+        # Custom Data for the app to handle the "Loud Sound" and "Action Buttons"
+        data_payload = {
+            "type": "availability_check",
+            "product_id": product_id,
+            "product_name": product_name,
+            "image_url": product_image if product_image else "",
+            "sound": "loud_shop_bell", # Frontend will map this to a raw resource
+            "priority": "high"
+        }
+
+        # Send to all owner tokens
+        await send_fcm_notification(
+            tokens,
+            title="Customer Waiting! 🔔",
+            body=f"Do you have {product_name} in stock?",
+            data=data_payload
+        )
+        logger.info(f"Sent availability request to owner {owner_id}")
+
+    except Exception as e:
+        logger.error(f"Error in send_owner_availability_request: {e}", exc_info=True)
+
+
+async def send_owner_fomo_alert(owner_id: str, product_name: str):
+    """
+    Sends a 'Fear Of Missing Out' notification.
+    Includes COOLDOWN logic to prevent spam.
+    """
+    try:
+        # 1. Cooldown Check (Simple In-Memory or DB approach)
+        # We will use the database to store the last alert time for this specific product+owner
+        
+        # Check 'fomo_cooldowns' in shops_collection
+        
+        shop = shops_collection.find_one({"owner_id": owner_id})
+        if not shop: return
+        
+        # safely get nested dict
+        fomo_cooldowns = shop.get("fomo_cooldowns", {})
+        last_alert_time = fomo_cooldowns.get(product_name, None)
+        
+        if last_alert_time:
+            # If alerted in last 1 hour, SKIP
+            if (datetime.utcnow() - last_alert_time).total_seconds() < 3600:
+                return
+
+        # 2. Send Notification
+        owner = users_collection.find_one({"uid": owner_id}) # owner_id in shops is usually uid
+        if not owner: 
+             # Fallback to _id if uid lookup fails (unlikely given schema, but safe)
+             if ObjectId.is_valid(owner_id):
+                 owner = users_collection.find_one({"_id": ObjectId(owner_id)})
+        
+        if not owner: return
+        
+        tokens = owner.get("fcm_tokens", [])
+        if not tokens: return
+
+        await send_fcm_notification(
+            tokens,
+            title="⚠️ Missed Sale Alert",
+            body=f"Someone just searched for '{product_name}' near you, but you have 0 stock. Restock now?",
+            data={"screen": "Inventory", "highlight": product_name}
+        )
+
+        # 3. Update Cooldown
+        shops_collection.update_one(
+            {"owner_id": owner_id},
+            {"$set": {f"fomo_cooldowns.{product_name}": datetime.utcnow()}}
+        )
+        logger.info(f"Sent FOMO alert to owner {owner_id} for {product_name}")
+
+    except Exception as e:
+        logger.error(f"Error in send_owner_fomo_alert: {e}", exc_info=True)

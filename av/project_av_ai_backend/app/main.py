@@ -75,7 +75,8 @@ from app.notifications import ( # Import your new notification functions
     send_owner_night_stock_reminder,
     send_customer_morning_essentials,
     send_customer_deals_reminder,
-    send_subscription_reminders
+    send_subscription_reminders,
+    send_owner_availability_request
     # Add other customer functions here later
 )
 from pydantic import BaseModel # Ensure this is imported
@@ -404,11 +405,11 @@ async def upload_and_predict(file: UploadFile = File(...)):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 # HELPER FUNCTION FOR BACKGROUND IMAGE UPLOAD
-async def upload_image_and_update_db(temp_image_id: str, product_id: ObjectId): # <-- ARGUMENTS CHANGED
+# HELPER FUNCTION FOR BACKGROUND IMAGE UPLOAD
+async def upload_image_and_update_db(temp_image_id: str, product_id: ObjectId): 
     """
-    This function runs in the background AFTER the user gets a "success" response.
-    It uploads the image from the temp folder to Cloudinary, updates MongoDB,
-    and then deletes the temp file.
+    This function runs in the background. 
+    It uploads the image to Cloudinary (FORCING PNG to keep transparency) and updates MongoDB.
     """
     temp_file_path = os.path.join(TEMP_UPLOAD_DIR, temp_image_id)
     try:
@@ -417,42 +418,44 @@ async def upload_image_and_update_db(temp_image_id: str, product_id: ObjectId): 
             products_collection.update_one({"_id": product_id},{"$set": {"status": "upload_failed"}})
             return
 
-        # 1. Upload the image file from the path (the slow part)
+        # 1. Upload the image file
+        # CRITICAL CHANGE: format="png" ensures transparency is kept.
+        # transformation={"quality": "auto"} helps size but keeps PNG structure.
         upload_result = cloudinary.uploader.upload(
-            temp_file_path, # <-- CHANGED: Upload from file path
-            folder="project_av_products"
+            temp_file_path,
+            folder="project_av_products",
+            format="png", 
+            transformation=[
+                {'quality': "auto"}
+            ]
         )
         
-        public_id = upload_result.get("public_id")
+        # 2. Get the secure URL directly
+        image_url = upload_result.get("secure_url")
         
-        if not public_id:
-            logger.error(f"BG Upload Failed: Image upload failed for product {product_id}, public_id not found.")
+        if not image_url:
+            logger.error(f"BG Upload Failed: Image upload failed for product {product_id}, secure_url not found.")
             products_collection.update_one({"_id": product_id},{"$set": {"status": "upload_failed"}})
             return
-
-        # 2. Construct the final URL with background removal
-        image_url = f"https://res.cloudinary.com/dwg7jqdq7/image/upload/e_background_removal/{public_id}.jpg"
         
-        # 3. Update the product record in MongoDB with the final URL
+        # 3. Update the product record in MongoDB
         products_collection.update_one(
             {"_id": product_id},
             {"$set": {
                 "imageUrl": image_url,
-                "status": "visible" # Mark as ready
+                "status": "visible"
             }}
         )
         logger.info(f"BG Upload Success: Successfully processed image for product {product_id}")
     
     except Exception as e:
-        logger.error(f"BG Upload Failed: Background image upload failed for product {product_id}: {traceback.format_exc()}")
-        # Mark the product as failed so it can be fixed later
+        logger.error(f"BG Upload Failed: Image upload failed for product {product_id}: {traceback.format_exc()}")
         products_collection.update_one(
             {"_id": product_id},
             {"$set": {"status": "upload_failed"}}
         )
     
     finally:
-        # --- 4. IMPORTANT: CLEAN UP THE TEMP FILE ---
         if os.path.exists(temp_file_path):
             try:
                 os.remove(temp_file_path)
@@ -462,30 +465,55 @@ async def upload_image_and_update_db(temp_image_id: str, product_id: ObjectId): 
 
 @app.post("/add-product/")
 async def add_product(
-    background_tasks: BackgroundTasks, # <-- This is still needed
+    background_tasks: BackgroundTasks,
     product_name: str = Form(...),
-    price: float = Form(...),
+    price: str = Form(...), # Changed to str to handle potential parsing issues
     unit: str = Form(...),
     owner_id: str = Form(...),
-    count: int = Form(...),
+    count: str = Form(...), # Changed to str to handle potential parsing issues
     temp_image_id: str = Form(...),
     category: str = Form(...)
 ):
     try:
-        # --- THE FILE READ IS GONE, MAKING THIS STEP FAST ---
+        # Debug Logging: This will show in your terminal what exactly is being sent
+        logger.info(f"Received Add Product: Name='{product_name}', Price='{price}', Count='{count}', Unit='{unit}', Category='{category}'")
+
+        # --- Validate and Convert Inputs ---
+        
+        # 1. Price Validation
+        try:
+            clean_price = price.strip()
+            if not clean_price:
+                raise ValueError("Empty price")
+            final_price = float(clean_price)
+        except ValueError:
+             logger.error(f"Price validation failed for value: '{price}'")
+             raise HTTPException(status_code=400, detail=f"Invalid price: '{price}'. Must be a number.")
+
+        # 2. Count Validation
+        try:
+            clean_count = count.strip()
+            if not clean_count:
+                raise ValueError("Empty count")
+            # Handle cases like "5.0" being sent as integer
+            final_count = int(float(clean_count)) 
+        except ValueError:
+             logger.error(f"Count validation failed for value: '{count}'")
+             raise HTTPException(status_code=400, detail=f"Invalid stock count: '{count}'. Must be an integer.")
 
         # --- 3. SAVE TEXT DATA TO DB FIRST (This is fast) ---
         product_dict = {
             "product_name": sanitize_input(product_name),
-            "price": price,
+            "price": final_price,
             "unit": unit,
             "owner_id": owner_id,
-            "count": count,
+            "count": final_count,
             "category": category,
             "imageUrl": None, # Placeholder
             "status": "processing_image", # New status field
             "inStock": True,
-            "created_at": datetime.utcnow()
+            "created_at": datetime.utcnow(),
+            "last_updated": datetime.utcnow() 
         }
         
         shop = shops_collection.find_one({"owner_id": owner_id})
@@ -496,18 +524,18 @@ async def add_product(
         product_id = result.inserted_id # Get the new product's ObjectId
         product_id_str = str(product_id)
         
-        # --- 4. ADD THE SLOW UPLOAD TO THE BACKGROUND ---
-        # We now pass the temp_image_id, not the file data
+        # --- 4. ADD THE UPLOAD TO BACKGROUND TASKS ---
+        # We passes the temp_image_id to the updated function
         background_tasks.add_task(upload_image_and_update_db, temp_image_id, product_id)
         
-        # --- 5. RETURN SUCCESS TO THE APP IMMEDIATELY ---
-        # The app gets this response in <1 second
+        # --- 5. RETURN SUCCESS IMMEDIATELY ---
         return {
             "message": "Product added successfully",
             "product_id": product_id_str,
-            # Send the saved data back to the app
             "product": {**product_dict, "_id": product_id_str, "created_at": product_dict["created_at"].isoformat()}
         }
+    except HTTPException as he:
+        raise he
     except Exception as e:
         logger.error(f"Error adding product (sync part): {traceback.format_exc()}")
         return JSONResponse(status_code=500, content={"error": f"Failed to add product: {str(e)}"})
@@ -874,16 +902,20 @@ async def update_product(product_id: str, updated_data: dict):
             
         if "inStock" in updated_data:
             update_payload["inStock"] = bool(updated_data["inStock"])
-            update_payload["lastUpdated"] = datetime.utcnow().isoformat()
+            # update_payload["lastUpdated"] was already there, but let's ensure consistency
+            update_payload["last_updated"] = datetime.utcnow()
             
         # ADD THIS BLOCK TO HANDLE THE 'count' FIELD
         if updated_data.get("count") is not None:
             try:
                 # Ensure count is a whole number
                 update_payload["count"] = int(updated_data["count"])
+                # Update timestamp on stock change
+                update_payload["last_updated"] = datetime.utcnow()
             except (ValueError, TypeError):
                 # If conversion fails, ignore the field or return an error
                 pass 
+        update_payload["last_updated"] = datetime.utcnow()        
 
         # If there's nothing to update, return an error.
         if not update_payload:
@@ -957,7 +989,14 @@ async def get_deals_products(
                     "distance": {"$divide": ["$distance_in_meters", 1000]},
                     "isOnSale": "$products.isOnSale",
                     "salePrice": "$products.salePrice",
-                    "saleDescription": "$products.saleDescription"
+                    "saleDescription": "$products.saleDescription",
+                    # FIX: Explicitly format date to match Frontend's SimpleDateFormat 'yyyy-MM-ddTHH:mm:ss.SSSZ'
+                    "saleEndDate": {
+                        "$dateToString": {
+                            "format": "%Y-%m-%dT%H:%M:%S.%LZ",
+                            "date": "$products.saleEndDate"
+                        }
+                    }
                 }
             }
         ]
@@ -1826,9 +1865,73 @@ async def bulk_stock_update(owner_id: str = Query(...), in_stock: bool = Query(.
     try:
         result = products_collection.update_many(
             {"owner_id": owner_id},
-            {"$set": {"inStock": in_stock}}
+            {"$set": {
+                "inStock": in_stock,
+                "last_updated": datetime.utcnow() # NEW: Update timestamp
+            }}
         )
         return {"message": f"Updated {result.modified_count} products"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+class AvailabilityRequest(BaseModel):
+    product_id: str
+    user_id: str # Optional: to track who asked (for future features)
+
+@app.post("/ask-availability")
+async def ask_availability(request: AvailabilityRequest):
+    try:
+        product_obj_id = safe_object_id(request.product_id)
+        product = products_collection.find_one({"_id": product_obj_id})
+        
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        # Send High Priority Notification with Sound
+        await send_owner_availability_request(
+            owner_id=product["owner_id"],
+            product_name=product["product_name"],
+            product_image=product.get("imageUrl"),
+            product_id=str(product["_id"])
+        )
+        
+        return {"success": True, "message": "Owner notified"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+class AvailabilityResponse(BaseModel):
+    product_id: str
+    status: str # "yes" or "no"
+
+@app.post("/respond-availability")
+async def respond_availability(response: AvailabilityResponse):
+    try:
+        product_obj_id = safe_object_id(response.product_id)
+        
+        if response.status.lower() == "yes":
+            # Owner confirmed stock -> Update count, InStock, and Timestamp
+            products_collection.update_one(
+                {"_id": product_obj_id},
+                {"$set": {
+                    "inStock": True,
+                    "count": 5, # Default small inventory count
+                    "last_updated": datetime.utcnow() # Reset Freshness
+                }}
+            )
+            return {"success": True, "message": "Stock updated to available"}
+            
+        elif response.status.lower() == "no":
+            # Owner confirmed NO stock -> Just update timestamp (verified empty)
+            products_collection.update_one(
+                {"_id": product_obj_id},
+                {"$set": {
+                    "inStock": False,
+                    "count": 0,
+                    "last_updated": datetime.utcnow()
+                }}
+            )
+            return {"success": True, "message": "Stock verified as empty"}
+            
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 

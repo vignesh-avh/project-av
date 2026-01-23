@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from app.db import (
     shops_collection, 
     products_collection, 
     product_views_collection, 
-    product_sales_collection
+    product_sales_collection,
+    users_collection
 )
 from app.schemas.shop import ShopCreate
 from bson import ObjectId
@@ -99,54 +100,81 @@ async def update_owner_location(owner_id: str = Query(...), lat: float = Query(.
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+
+def check_missed_opportunities(product_name: str, user_lat: float, user_lng: float):
+    try:
+        # 1. Find products that match the name BUT have 0 stock
+        search_regex = {"$regex": product_name, "$options": "i"}
+        missed_products = list(products_collection.find({
+            "product_name": search_regex,
+            "count": 0, # Specifically looking for OUT OF STOCK
+            "owner_id": {"$exists": True}
+        }))
+
+        if not missed_products:
+            return
+
+        # 2. Filter for shops nearby
+        from app.notifications import send_owner_fomo_alert # Import here to avoid circular dependency
+        
+        for product in missed_products:
+            shop = shops_collection.find_one({"owner_id": product["owner_id"]})
+            if shop:
+                shop_lat, shop_lng = extract_shop_coordinates(shop)
+                if shop_lat and shop_lng:
+                    dist = haversine(user_lat, user_lng, shop_lat, shop_lng)
+                    if dist <= 5: # Only notify if user is within 5km
+                        # Trigger the notification logic (checks cooldown internally)
+                        # We pass the product name explicitly to show "Customer looking for Bread"
+                        import asyncio
+                        asyncio.run(send_owner_fomo_alert(product["owner_id"], product["product_name"]))
+                        
+    except Exception as e:
+        print(f"FOMO Check Error: {e}")
+
 @router.get("/get-shops")
 async def get_shops(
+    background_tasks: BackgroundTasks,
     product_name: str = Query(...),
     user_lat: float = Query(...),
     user_lng: float = Query(...),
-    in_stock: bool = Query(True)  # NEW PARAMETER
+    in_stock: bool = Query(True)
 ):
     try:
-        # Modified query with inStock condition
+        background_tasks.add_task(check_missed_opportunities, product_name, user_lat, user_lng)
+        # Searches for the exact input (e.g., "Kirana Items") in Name OR Category.
+        search_regex = {"$regex": product_name, "$options": "i"}
+        
         query = {
-            "product_name": {"$regex": product_name, "$options": "i"},
-            "inStock": True if in_stock else {"$in": [True, False]},
-            "count": {"$gt": 0}
+            "$or": [
+                {"product_name": search_regex},
+                {"category": search_regex} 
+            ]
         }
+        if in_stock:
+            query["inStock"] = True
+            query["count"] = {"$gt": 0}
 
         matching_products = list(products_collection.find(query))
-        
-        print(f"Found {len(matching_products)} matching products for '{product_name}'")
-        
-        if matching_products:
-            print(f"Sample product: {matching_products[0]}")
         
         if not matching_products:
             return {"shops": []}
 
         # Get unique owner IDs from matching products
         owner_ids = list(set([p["owner_id"] for p in matching_products]))
-        print(f"Found shops for owner IDs: {owner_ids}")
         
         # Find shops for these owners
         shops = list(shops_collection.find({
             "owner_id": {"$in": owner_ids}
         }))
-        print(f"Found {len(shops)} shops")
-        
-        if shops:
-            print(f"Sample shop: {shops[0]}")
         
         shops_with_products = []
         
         for shop in shops:
-            # FIXED: Use standardized coordinate extraction
             shop_lat, shop_lng = extract_shop_coordinates(shop)
             if shop_lat is None or shop_lng is None:
-                print(f"Skipping shop {shop['_id']} - missing location data")
                 continue
                 
-            # Use validated Haversine
             distance = haversine(user_lat, user_lng, shop_lat, shop_lng)
             
             # Get products for this specific shop
@@ -167,7 +195,6 @@ async def get_shops(
         
         # Sort by distance
         shops_with_products.sort(key=lambda x: x["distance"])
-        print(f"Returning {len(shops_with_products)} shops with products")
         return {"shops": shops_with_products}
 
     except Exception as e:
@@ -191,7 +218,7 @@ async def get_shop(id: str = Query(...)):
                 "pipeline": [
                     {"$match": {
                         "$expr": {"$eq": ["$shop_id", "$$shop_id_str"]},
-                        "count": {"$gt": 0},
+                    
                     }}
                 ],
                 "as": "products"
@@ -213,6 +240,7 @@ async def get_shop(id: str = Query(...)):
                             "salePrice": "$$prod.salePrice",
                             "saleDescription": "$$prod.saleDescription",
                             "saleEndDate": "$$prod.saleEndDate",
+                            "last_updated": "$$prod.last_updated",
                             "saleDaysLeft": {
                                 "$cond": {
                                     "if": {"$and": ["$$prod.isOnSale", "$$prod.saleEndDate"]},
@@ -406,7 +434,7 @@ async def get_extended_deals(
                     "saleDescription": "$products.saleDescription",
                     # --- NEW: Project real sold count for frontend ---
                     "sold_count": {"$ifNull": ["$products.sale_count", 0]},
-                    "marketing_tagline": "Worth the drive!"
+                    "marketing_tagline": {"$literal": "Worth the distance"}
                 }
             }
         ]
@@ -427,9 +455,13 @@ async def get_trending_products(
 ):
     try:
         # Dynamic Match
+        # FIX: Include items if NOT on sale OR if sale has EXPIRED
         match_query = {
             "products.inStock": True,
-            "products.isOnSale": {"$ne": True}
+            "$or": [
+                {"products.isOnSale": {"$ne": True}},
+                {"products.saleEndDate": {"$lt": datetime.utcnow()}}
+            ]
         }
         if category and category != "All":
             match_query["products.category"] = category
@@ -468,11 +500,19 @@ async def get_trending_products(
                     "shop_id": {"$toString": "$_id"},
                     "shop_name": "$name",
                     "distance": {"$divide": ["$distance_in_meters", 1000]},
-                    "isOnSale": "$products.isOnSale",
+                    # FIX: Force isOnSale to False if the date has passed so it appears as a normal product
+                    "isOnSale": {
+                        "$cond": {
+                            "if": { "$lt": ["$products.saleEndDate", datetime.utcnow()] },
+                            "then": False,
+                            "else": "$products.isOnSale"
+                        }
+                    },
                     "salePrice": "$products.salePrice",
                     "saleDescription": "$products.saleDescription",
                     # --- NEW: Project real sold count for frontend ---
-                    "sold_count": {"$ifNull": ["$products.sale_count", 0]} 
+                    "sold_count": {"$ifNull": ["$products.sale_count", 0]},
+                    "marketing_tagline": {"$literal": "Trending now"}
                 }
             }
         ]
@@ -494,9 +534,13 @@ async def get_best_price_products(
 ):
     try:
         # Dynamic Match
+        # FIX: Include items if NOT on sale OR if sale has EXPIRED
         match_query = {
             "products.inStock": True,
-            "products.isOnSale": {"$ne": True}
+            "$or": [
+                {"products.isOnSale": {"$ne": True}},
+                {"products.saleEndDate": {"$lt": datetime.utcnow()}}
+            ]
         }
         if category and category != "All":
             match_query["products.category"] = category
@@ -540,33 +584,50 @@ async def get_best_price_products(
                     "shop_id": {"$toString": "$_id"},
                     "shop_name": "$name",
                     "distance": {"$divide": ["$distance_in_meters", 1000]},
-                    "isOnSale": "$products.isOnSale",
+                    # FIX: Force isOnSale to False if the date has passed
+                    "isOnSale": {
+                        "$cond": {
+                            "if": { "$lt": ["$products.saleEndDate", datetime.utcnow()] },
+                            "then": False,
+                            "else": "$products.isOnSale"
+                        }
+                    },
                     "salePrice": "$products.salePrice",
-                    "saleDescription": "$products.saleDescription"
+                    "saleDescription": "$products.saleDescription",
+                    "sold_count": {"$ifNull": ["$products.sale_count", 0]}
                 }
             }
         ]
         best_price = list(shops_collection.aggregate(pipeline))
 
-        # --- NEW: Add Dynamic Energetic Taglines ---
-        # List of energetic phrases
-        marketing_phrases = [
-            "Cheaper than before!",
-            "Lowest price nearby!",
-            "Price Drop Alert!",
-            "Unbeatable Value!",
-            "Super Saver Deal!",
-            "Less price than others!",
-            "Market Best Rate!",
-            "Huge Savings Today!"
+        default_phrases = [
+            "Lowest price nearby",
+            "Unbeatable Value",
+            "Market Best Rate",
+            "Huge Savings Today"
         ]
 
-        # Assign a phrase to each product based on its name length (deterministic but looks random)
         for i, product in enumerate(best_price):
-            # Calculate an index to pick a phrase
-            # We use product name length + index to ensure variety
-            phrase_index = (len(product.get("product_name", "")) + i) % len(marketing_phrases)
-            product["marketing_tagline"] = marketing_phrases[phrase_index]
+            # Calculate specific savings if applicable
+            price = product.get("price")
+            sale_price = product.get("salePrice")
+            is_on_sale = product.get("isOnSale")
+
+            tagline = ""
+            
+            # Logic: If on sale and cheaper than original, show specific saving
+            if is_on_sale and price and sale_price and (price > sale_price):
+                saving = int(price - sale_price)
+                if saving > 0:
+                    tagline = f"₹{saving} cheaper nearby"
+            
+            # Fallback if no specific saving calc available
+            if not tagline:
+                phrase_index = (len(product.get("product_name", "")) + i) % len(default_phrases)
+                tagline = default_phrases[phrase_index]
+
+            # Assign to snake_case key
+            product["marketing_tagline"] = tagline
 
         return {"products": best_price}
         
@@ -738,3 +799,51 @@ async def get_inventory_alerts(owner_id: str = Query(...), limit: int = 5):
     except Exception as e:
         print(f"Inventory alerts error: {str(e)}")
         return {"alerts": []}
+
+
+@router.get("/get-nearby-shops")
+async def get_nearby_shops(
+    lat: float = Query(...),
+    lng: float = Query(...),
+    limit: int = 20
+):
+    try:
+        pipeline = [
+            {
+                "$geoNear": {
+                    "near": {"type": "Point", "coordinates": [lng, lat]},
+                    "distanceField": "distance_in_meters",
+                    "maxDistance": 10000, # 10km Radius
+                    "spherical": True
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "products",
+                    "let": { "shop_id_str": { "$toString": "$_id" } },
+                    "pipeline": [
+                        { "$match": { "$expr": { "$eq": [ "$shop_id", "$$shop_id_str" ] } } },
+                        { "$limit": 4 } # Get top 4 items for the preview strip
+                    ],
+                    "as": "preview_products"
+                }
+            },
+            {
+                "$project": {
+                    "_id": {"$toString": "$_id"},
+                    "name": 1,
+                    "rating": 1,
+                    "distance": {"$divide": ["$distance_in_meters", 1000]},
+                    # Send images for the "Crowded" look
+                    "preview_images": "$preview_products.imageUrl", 
+                    "products": "$preview_products.product_name" # Send names for fallback
+                }
+            },
+            { "$limit": limit }
+        ]
+        
+        shops = list(shops_collection.aggregate(pipeline))
+        return {"shops": shops}
+    except Exception as e:
+        print(f"Error fetching nearby shops: {str(e)}")
+        return {"shops": []}
