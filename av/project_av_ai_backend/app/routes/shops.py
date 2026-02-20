@@ -4,7 +4,8 @@ from app.db import (
     products_collection, 
     product_views_collection, 
     product_sales_collection,
-    users_collection
+    users_collection,
+    orders_collection
 )
 from app.schemas.shop import ShopCreate
 from bson import ObjectId
@@ -79,6 +80,70 @@ def extract_shop_coordinates(shop):
             return float(coords[1]), float(coords[0])
     
     return None, None
+
+def compute_discount(product, user_lat, user_lng):
+    """
+    For a given product, find the nearest shop within 5km that sells the same product
+    and compute discount percentage if the current price is lower.
+    """
+    try:
+        current_shop = shops_collection.find_one({"_id": ObjectId(product["shop_id"])})
+        if not current_shop:
+            return 0
+        cur_lat, cur_lng = extract_shop_coordinates(current_shop)
+        if cur_lat is None or cur_lng is None:
+            return 0
+
+        # Find nearest shop within 5km with the same product
+        pipeline = [
+            {
+                "$geoNear": {
+                    "near": {"type": "Point", "coordinates": [cur_lng, cur_lat]},
+                    "distanceField": "distance",
+                    "maxDistance": 5000,
+                    "spherical": True,
+                    "query": {"_id": {"$ne": ObjectId(product["shop_id"])}}
+                }
+            },
+            {
+                "$lookup": {
+                    "from": "products",
+                    "let": {"shop_id_str": {"$toString": "$_id"}},
+                    "pipeline": [
+                        {"$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$shop_id", "$$shop_id_str"]},
+                                    {"$eq": ["$product_name", product["product_name"]]}
+                                ]
+                            }
+                        }}
+                    ],
+                    "as": "product_match"
+                }
+            },
+            {"$unwind": "$product_match"},
+            {"$limit": 1}, # <-- NEW: Only compare with the single nearest shop
+            {"$project": {"price": "$product_match.price"}}
+        ]
+        other_products = list(shops_collection.aggregate(pipeline))
+        if not other_products:
+            return 0
+
+        # Get the price from the nearest shop
+        other_shop_price = other_products[0]["price"]
+        current_price = product.get("salePrice") if product.get("isOnSale") else product.get("price")
+        if current_price is None:
+            return 0
+
+        # Calculate discount % only if the other shop is more expensive
+        if other_shop_price > current_price:
+            discount = ((other_shop_price - current_price) / other_shop_price) * 100
+            return int(discount)
+        return 0
+    except Exception as e:
+        print(f"Discount computation error: {e}")
+        return 0
 
 @router.post("/update-owner-location/")
 async def update_owner_location(owner_id: str = Query(...), lat: float = Query(...), lng: float = Query(...)):
@@ -274,7 +339,7 @@ async def get_shop(id: str = Query(...)):
         
 # ===== FIXED SHOP PERFORMANCE ENDPOINT =====
 @router.get("/owner/shop-performance")
-async def get_shop_performance(owner_id: str, days: int = 7):
+async def get_shop_performance(owner_id: str, days: int = 30): # <-- CHANGED: Default is now 30 days
     try:
         shop = shops_collection.find_one({"owner_id": owner_id})
         if not shop:
@@ -282,12 +347,8 @@ async def get_shop_performance(owner_id: str, days: int = 7):
             
         shop_id = str(shop["_id"])
 
-        # --- START OF FIX ---
         # Define the date range based on full calendar days for accuracy
-        
-        # Set end_date to the very end of today in UTC
         end_date = datetime.utcnow().replace(hour=23, minute=59, second=59, microsecond=999999)
-        # Set start_date to the very beginning of the day, 7 days ago
         start_date = (end_date - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
         
         # Initialize the map with all days in the range
@@ -295,7 +356,6 @@ async def get_shop_performance(owner_id: str, days: int = 7):
         for i in range(days):
             date_key = (start_date + timedelta(days=i)).strftime("%Y-%m-%d")
             performance_map[date_key] = {"date": date_key, "sales": 0, "views": 0}
-        # --- END OF FIX ---
             
         # Get sales data
         sales_pipeline = [
@@ -350,7 +410,6 @@ async def get_shop_performance(owner_id: str, days: int = 7):
     except Exception as e:
         print(f"Performance error: {str(e)}")
         return {"performance": []}
-
 
 # ===== UPDATED TOP PRODUCTS ENDPOINT =====
 @router.get("/owner/top-products")
@@ -530,11 +589,9 @@ async def get_best_price_products(
     user_lng: float = Query(...),
     limit: int = 10,
     skip: int = 0,
-    category: str = Query(None) # Added category param
+    category: str = Query(None)
 ):
     try:
-        # Dynamic Match
-        # FIX: Include items if NOT on sale OR if sale has EXPIRED
         match_query = {
             "products.inStock": True,
             "$or": [
@@ -550,7 +607,7 @@ async def get_best_price_products(
                 "$geoNear": {
                     "near": {"type": "Point", "coordinates": [user_lng, user_lat]},
                     "distanceField": "distance_in_meters",
-                    "maxDistance": 5000, # 5 kilometers
+                    "maxDistance": 5000,
                     "spherical": True,
                 }
             },
@@ -563,7 +620,7 @@ async def get_best_price_products(
                 }
             },
             {"$unwind": "$products"},
-            {"$match": match_query}, # Applied dynamic match
+            {"$match": match_query},
             {"$sort": {"products.sale_count": -1, "products.price": 1}},
             {"$group": {
                 "_id": "$products.product_name",
@@ -580,11 +637,10 @@ async def get_best_price_products(
                     "price": "$products.price",
                     "unit": "$products.unit",
                     "imageUrl": "$products.imageUrl",
-                    "category": "$products.category", # Return category
+                    "category": "$products.category",
                     "shop_id": {"$toString": "$_id"},
                     "shop_name": "$name",
                     "distance": {"$divide": ["$distance_in_meters", 1000]},
-                    # FIX: Force isOnSale to False if the date has passed
                     "isOnSale": {
                         "$cond": {
                             "if": { "$lt": ["$products.saleEndDate", datetime.utcnow()] },
@@ -600,37 +656,20 @@ async def get_best_price_products(
         ]
         best_price = list(shops_collection.aggregate(pipeline))
 
-        default_phrases = [
-            "Lowest price nearby",
-            "Unbeatable Value",
-            "Market Best Rate",
-            "Huge Savings Today"
-        ]
-
-        for i, product in enumerate(best_price):
-            # Calculate specific savings if applicable
-            price = product.get("price")
-            sale_price = product.get("salePrice")
-            is_on_sale = product.get("isOnSale")
-
-            tagline = ""
-            
-            # Logic: If on sale and cheaper than original, show specific saving
-            if is_on_sale and price and sale_price and (price > sale_price):
-                saving = int(price - sale_price)
-                if saving > 0:
-                    tagline = f"₹{saving} cheaper nearby"
-            
-            # Fallback if no specific saving calc available
-            if not tagline:
-                phrase_index = (len(product.get("product_name", "")) + i) % len(default_phrases)
-                tagline = default_phrases[phrase_index]
-
-            # Assign to snake_case key
-            product["marketing_tagline"] = tagline
+        # Add discountPercentage by calling compute_discount
+        for item in best_price:
+            # Construct a product dict for compute_discount
+            product_for_discount = {
+                "shop_id": item["shop_id"],
+                "product_name": item["product_name"],
+                "price": item["price"],
+                "isOnSale": item.get("isOnSale", False),
+                "salePrice": item.get("salePrice")
+            }
+            discount = compute_discount(product_for_discount, user_lat, user_lng)
+            item["discountPercentage"] = discount if discount > 0 else None
 
         return {"products": best_price}
-        
     except Exception as error:
         print(f"Best price error: {error}")
         return {"products": []}
@@ -801,29 +840,62 @@ async def get_inventory_alerts(owner_id: str = Query(...), limit: int = 5):
         return {"alerts": []}
 
 
+# REPLACE THE EXISTING get_nearby_shops ENDPOINT IN shops.py
 @router.get("/get-nearby-shops")
 async def get_nearby_shops(
     lat: float = Query(...),
     lng: float = Query(...),
-    limit: int = 20
+    limit: int = 20,
+    category: str = Query(None) # <-- NEW: Added category parameter
 ):
     try:
+        # Base GeoNear pipeline
         pipeline = [
             {
                 "$geoNear": {
                     "near": {"type": "Point", "coordinates": [lng, lat]},
                     "distanceField": "distance_in_meters",
-                    "maxDistance": 10000, # 10km Radius
+                    "maxDistance": 5000, 
                     "spherical": True
                 }
+            }
+        ]
+
+        # <-- NEW: Filter condition for category
+        product_match = { "$expr": { "$eq": [ "$shop_id", "$$shop_id_str" ] } }
+        if category and category != "All":
+            product_match["category"] = category
+            # If category is selected, only keep shops that have at least one product in this category
+            pipeline.extend([
+                {
+                    "$lookup": {
+                        "from": "products",
+                        "let": { "shop_id_str": { "$toString": "$_id" } },
+                        "pipeline": [
+                            { "$match": product_match },
+                            { "$limit": 1 }
+                        ],
+                        "as": "category_check"
+                    }
+                },
+                { "$match": { "category_check.0": { "$exists": True } } } # Only shops passing the check
+            ])
+
+        pipeline.extend([
+            {
+                "$addFields": {
+                    "total_views": { "$ifNull": ["$view_count", 0] } 
+                }
             },
+            { "$sort": { "total_views": -1, "distance_in_meters": 1 } },  
+            { "$limit": limit }, 
             {
                 "$lookup": {
                     "from": "products",
                     "let": { "shop_id_str": { "$toString": "$_id" } },
                     "pipeline": [
-                        { "$match": { "$expr": { "$eq": [ "$shop_id", "$$shop_id_str" ] } } },
-                        { "$limit": 4 } # Get top 4 items for the preview strip
+                        { "$match": product_match }, # <-- NEW: Applies the category filter to preview products too
+                        { "$limit": 4 }
                     ],
                     "as": "preview_products"
                 }
@@ -834,16 +906,34 @@ async def get_nearby_shops(
                     "name": 1,
                     "rating": 1,
                     "distance": {"$divide": ["$distance_in_meters", 1000]},
-                    # Send images for the "Crowded" look
-                    "preview_images": "$preview_products.imageUrl", 
-                    "products": "$preview_products.product_name" # Send names for fallback
+                    "total_views": 1,
+                    "preview_images": "$preview_products.imageUrl",
+                    "products": "$preview_products.product_name"
                 }
-            },
-            { "$limit": limit }
-        ]
+            }
+        ])
         
         shops = list(shops_collection.aggregate(pipeline))
         return {"shops": shops}
     except Exception as e:
         print(f"Error fetching nearby shops: {str(e)}")
         return {"shops": []}
+
+# REPLACE THE EXISTING get_coin_history ENDPOINT IN shops.py
+@router.get("/user/coin-history")
+async def get_coin_history(user_id: str = Query(...)):
+    try:
+        # Find all orders for this user, sorted by date descending
+        orders = orders_collection.find({"user_id": user_id}).sort("timestamp", -1)
+        result = []
+        for order in orders:
+            result.append({
+                "dateTime": order["timestamp"].strftime("%b %d, %Y · %I:%M %p"),
+                "productNames": order.get("items", []),
+                "amount": order.get("total_amount", 0),
+                "coins": order.get("coins_earned", 3) # Fallback to 3 if missing
+            })
+        return {"transactions": result}
+    except Exception as e:
+        print(f"Error fetching coin history: {e}")
+        return {"transactions": []}

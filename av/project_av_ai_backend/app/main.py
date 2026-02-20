@@ -28,7 +28,11 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from app.routes.shops import haversine
 from datetime import datetime, timedelta, timezone
+from app.db import orders_collection
 
+import qrcode
+from io import BytesIO
+from fastapi.responses import StreamingResponse
 
 from fastapi import Form
 import jwt  # Added for token verification
@@ -597,7 +601,19 @@ async def checkout_cart(cart_items: List[dict]):
         # Use the real database _id for all subsequent operations
         user_db_id = user["_id"]
         
-        # =================== END OF CORRECTION ===================
+        # ---> FIX: Define reward_amount BEFORE creating the order_doc
+        reward_amount = 3
+        
+        order_doc = {
+            "user_id": str(user_db_id),  # store as string for easy query
+            "items": [item["product_name"] for item in cart_items],
+            "total_amount": sum(item["price"] * item["quantity"] for item in cart_items),
+            "coins_earned": reward_amount, # <--- BUG FIXED: Variable is now defined
+            "timestamp": datetime.utcnow()
+        }
+        
+        # Assuming you have defined orders_collection in db.py
+        orders_collection.insert_one(order_doc)
 
         # Decrement product count (this logic is now safe)
         for item in cart_items:
@@ -610,9 +626,6 @@ async def checkout_cart(cart_items: List[dict]):
         
         # Insert cart items into the cart collection (this logic is correct)
         result = cart_collection.insert_many(cart_items)
-        
-        # Add coins reward using the correct user_db_id
-        reward_amount = 3
         
         # Update user document using the correct ID
         users_collection.update_one(
@@ -645,7 +658,7 @@ async def checkout_cart(cart_items: List[dict]):
             status_code=500, 
             content={"error": f"Checkout failed: {str(e)}"}
         )
-# CHANGE 2: Fixed endpoint URL (removed trailing slash)
+        
 class AddToCartRequest(BaseModel):
     product_id: str
     user_id: str
@@ -934,6 +947,45 @@ async def update_product(product_id: str, updated_data: dict):
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/shop/generate-qr/{shop_id}")
+async def generate_shop_qr(shop_id: str):
+    """
+    Generates a QR code image encoding a deep link to the specific shop.
+    Returns the image directly as a PNG stream.
+    """
+    try:
+        if not ObjectId.is_valid(shop_id):
+            return JSONResponse(status_code=400, content={"error": "Invalid shop ID format"})
+        
+        # Format for deep linking scheme. 
+        # (Frontend AndroidManifest will need <data android:scheme="projectav" android:host="shop" />)
+        deep_link_url = f"projectav://shop/{shop_id}"
+        
+        # Generate QR code
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4,
+        )
+        qr.add_data(deep_link_url)
+        qr.make(fit=True)
+
+        # Create image
+        img = qr.make_image(fill_color="black", back_color="white")
+        
+        # Save to buffer and return as streaming response
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        
+        return StreamingResponse(buf, media_type="image/png")
+    except Exception as e:
+        logger.error(f"Error generating QR code: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": "Failed to generate QR code"})
+        
 
 @app.get("/products/deals")
 async def get_deals_products(
@@ -2255,7 +2307,8 @@ async def update_promotion(product_id: str, promo_data: PromotionData):
             "isOnSale": True,
             "salePrice": promo_data.salePrice,
             "saleDescription": promo_data.saleDescription,
-            "saleEndDate": end_date
+            "saleEndDate": end_date,
+            "last_updated": datetime.utcnow()
         }
 
         result = products_collection.update_one(
