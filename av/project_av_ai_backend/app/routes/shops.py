@@ -267,23 +267,24 @@ async def get_shops(
         return {"shops": []}
 
 # FIXED: Direction-ready shop data
+# REPLACE YOUR EXISTING get_shop ENDPOINT IN shops.py WITH THIS ONE
 @router.get("/get-shop")
 async def get_shop(id: str = Query(...)):
     try:
-        if not ObjectId.is_valid(id):
-            return JSONResponse(status_code=400, content={"error": "Invalid shop ID format"})
-
-        shop_id_obj = ObjectId(id)
+        # FIX: Allow searching by EITHER the Shop's _id OR the Owner's uid!
+        # This makes the QR code and deep links work perfectly and fixes "No Shop Found"
+        match_conditions = [{"owner_id": id}]
+        if ObjectId.is_valid(id):
+            match_conditions.append({"_id": ObjectId(id)})
 
         pipeline = [
-            {"$match": {"_id": shop_id_obj}},
+            {"$match": {"$or": match_conditions}},
             {"$lookup": {
                 "from": "products",
                 "let": {"shop_id_str": {"$toString": "$_id"}},
                 "pipeline": [
                     {"$match": {
                         "$expr": {"$eq": ["$shop_id", "$$shop_id_str"]},
-                    
                     }}
                 ],
                 "as": "products"
@@ -821,12 +822,12 @@ async def get_owner_dashboard_metrics(owner_id: str = Query(...)):
 
 
 @router.get("/owner/inventory-alerts")
-async def get_inventory_alerts(owner_id: str = Query(...), limit: int = 5):
+async def get_inventory_alerts(owner_id: str = Query(...), limit: int = Query(50)):
     try:
-        # Find products with low stock count (e.g., less than 5)
+        # Find products with low stock count (e.g., 5 or less)
         alert_products = products_collection.find({
             "owner_id": owner_id,
-            "count": {"$lt": 5}
+            "count": {"$lte": 5}
         }).sort("count", 1).limit(limit) # Sort by lowest count first
 
         products_list = []
@@ -838,6 +839,26 @@ async def get_inventory_alerts(owner_id: str = Query(...), limit: int = 5):
     except Exception as e:
         print(f"Inventory alerts error: {str(e)}")
         return {"alerts": []}
+
+@router.get("/owner/active-promotions")
+async def get_active_promotions(owner_id: str = Query(...)):
+    try:
+        # Find products that are currently on sale and haven't expired
+        promotions = list(products_collection.find({
+            "owner_id": owner_id,
+            "isOnSale": True,
+            "saleEndDate": {"$gte": datetime.utcnow()}
+        }).sort("saleEndDate", 1)) # Sort by ending soonest
+        
+        products_list = []
+        for product in promotions:
+            product['_id'] = str(product['_id'])
+            products_list.append(product)
+            
+        return {"promotions": products_list}
+    except Exception as e:
+        print(f"Active promotions error: {str(e)}")
+        return {"promotions": []}
 
 
 # REPLACE THE EXISTING get_nearby_shops ENDPOINT IN shops.py
@@ -921,18 +942,34 @@ async def get_nearby_shops(
 
 # REPLACE THE EXISTING get_coin_history ENDPOINT IN shops.py
 @router.get("/user/coin-history")
-async def get_coin_history(user_id: str = Query(...)):
+async def get_coin_history(
+    user_id: str = Query(...),
+    timeRange: str = Query("last30")  # <-- NEW: Added timeRange parameter (default 'last30')
+):
     try:
-        # Find all orders for this user, sorted by date descending
-        orders = orders_collection.find({"user_id": user_id}).sort("timestamp", -1)
+        # Base query to find orders for the user
+        query = {"user_id": user_id}
+
+        # <-- NEW: Apply date filtering if 'last30' is selected
+        if timeRange == "last30":
+            thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+            query["timestamp"] = {"$gte": thirty_days_ago}
+
+        # Find orders matching the query, sorted by date descending
+        orders = orders_collection.find(query).sort("timestamp", -1)
         result = []
+        
         for order in orders:
+            # Convert UTC timestamp to IST (+5 hours, 30 minutes)
+            ist_time = order["timestamp"] + timedelta(hours=5, minutes=30)
+            
             result.append({
-                "dateTime": order["timestamp"].strftime("%b %d, %Y · %I:%M %p"),
+                "dateTime": ist_time.strftime("%b %d, %Y · %I:%M %p"),
                 "productNames": order.get("items", []),
                 "amount": order.get("total_amount", 0),
                 "coins": order.get("coins_earned", 3) # Fallback to 3 if missing
             })
+            
         return {"transactions": result}
     except Exception as e:
         print(f"Error fetching coin history: {e}")

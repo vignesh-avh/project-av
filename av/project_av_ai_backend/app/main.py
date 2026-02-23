@@ -29,6 +29,11 @@ from datetime import datetime, timedelta
 from app.routes.shops import haversine
 from datetime import datetime, timedelta, timezone
 from app.db import orders_collection
+from PIL import ImageDraw, ImageFont
+
+from fastapi.responses import HTMLResponse
+from PIL import ImageDraw, ImageFont
+
 
 import qrcode
 from io import BytesIO
@@ -101,6 +106,17 @@ def simple_test_job():
     logger.info("!!!!!!!!!!!!!! APSCHEDULER TEST JOB IS RUNNING !!!!!!!!!!!!!!")
 
 TEMP_UPLOAD_DIR = "temp_uploads"
+
+VALID_CATEGORIES = [
+    "Kirana",
+    "Snacks",
+    "Dairy",
+    "Drinks",
+    "Fruits & vegetables",
+    "TechTools",
+    "Stat.",
+    "Others"
+]
 
 class SaleData(BaseModel):
     product_id: str
@@ -471,19 +487,22 @@ async def upload_image_and_update_db(temp_image_id: str, product_id: ObjectId):
 async def add_product(
     background_tasks: BackgroundTasks,
     product_name: str = Form(...),
-    price: str = Form(...), # Changed to str to handle potential parsing issues
+    price: str = Form(...),
     unit: str = Form(...),
     owner_id: str = Form(...),
-    count: str = Form(...), # Changed to str to handle potential parsing issues
+    count: str = Form(...),
     temp_image_id: str = Form(...),
     category: str = Form(...)
 ):
     try:
-        # Debug Logging: This will show in your terminal what exactly is being sent
+        # Debug Logging
         logger.info(f"Received Add Product: Name='{product_name}', Price='{price}', Count='{count}', Unit='{unit}', Category='{category}'")
 
-        # --- Validate and Convert Inputs ---
-        
+        # --- NEW: Category Validation ---
+        if category not in VALID_CATEGORIES:
+             logger.error(f"Invalid category attempted: '{category}'")
+             raise HTTPException(status_code=400, detail=f"Invalid category: '{category}'. Must be one of the updated categories.")
+
         # 1. Price Validation
         try:
             clean_price = price.strip()
@@ -499,22 +518,21 @@ async def add_product(
             clean_count = count.strip()
             if not clean_count:
                 raise ValueError("Empty count")
-            # Handle cases like "5.0" being sent as integer
             final_count = int(float(clean_count)) 
         except ValueError:
              logger.error(f"Count validation failed for value: '{count}'")
              raise HTTPException(status_code=400, detail=f"Invalid stock count: '{count}'. Must be an integer.")
 
-        # --- 3. SAVE TEXT DATA TO DB FIRST (This is fast) ---
+        # --- 3. SAVE TEXT DATA TO DB FIRST ---
         product_dict = {
             "product_name": sanitize_input(product_name),
             "price": final_price,
             "unit": unit,
             "owner_id": owner_id,
             "count": final_count,
-            "category": category,
-            "imageUrl": None, # Placeholder
-            "status": "processing_image", # New status field
+            "category": category, # New category strictly saved here
+            "imageUrl": None,
+            "status": "processing_image",
             "inStock": True,
             "created_at": datetime.utcnow(),
             "last_updated": datetime.utcnow() 
@@ -525,11 +543,10 @@ async def add_product(
             product_dict["shop_id"] = str(shop["_id"])
         
         result = products_collection.insert_one(product_dict)
-        product_id = result.inserted_id # Get the new product's ObjectId
+        product_id = result.inserted_id
         product_id_str = str(product_id)
         
         # --- 4. ADD THE UPLOAD TO BACKGROUND TASKS ---
-        # We passes the temp_image_id to the updated function
         background_tasks.add_task(upload_image_and_update_db, temp_image_id, product_id)
         
         # --- 5. RETURN SUCCESS IMMEDIATELY ---
@@ -894,13 +911,10 @@ async def check_shop_exists(owner_id: str = Query(...)):
 @app.put("/update-product/{product_id}")
 async def update_product(product_id: str, updated_data: dict):
     try:
-        obj_id = safe_object_id(product_id) # Uses the helper function
+        obj_id = safe_object_id(product_id)
 
-        # Create a dynamic payload for $set.
-        # This ensures we only update the fields that are sent from the frontend.
         update_payload = {}
 
-        # Check for each possible field and add it to the payload if it exists
         if "product_name" in updated_data:
             update_payload["product_name"] = sanitize_input(updated_data["product_name"])
         
@@ -910,31 +924,28 @@ async def update_product(product_id: str, updated_data: dict):
         if "unit" in updated_data:
             update_payload["unit"] = updated_data["unit"]
 
-        if "category" in updated_data: # <--- ADD THIS BLOCK
+        # --- NEW: Category Validation for Updates ---
+        if "category" in updated_data:
+            if updated_data["category"] not in VALID_CATEGORIES and updated_data["category"] != "All":
+                return JSONResponse(status_code=400, content={"error": f"Invalid category: {updated_data['category']}"})
             update_payload["category"] = updated_data["category"]
             
         if "inStock" in updated_data:
             update_payload["inStock"] = bool(updated_data["inStock"])
-            # update_payload["lastUpdated"] was already there, but let's ensure consistency
             update_payload["last_updated"] = datetime.utcnow()
             
-        # ADD THIS BLOCK TO HANDLE THE 'count' FIELD
         if updated_data.get("count") is not None:
             try:
-                # Ensure count is a whole number
                 update_payload["count"] = int(updated_data["count"])
-                # Update timestamp on stock change
                 update_payload["last_updated"] = datetime.utcnow()
             except (ValueError, TypeError):
-                # If conversion fails, ignore the field or return an error
                 pass 
+                
         update_payload["last_updated"] = datetime.utcnow()        
 
-        # If there's nothing to update, return an error.
         if not update_payload:
             return JSONResponse(status_code=400, content={"error": "No update data provided"})
 
-        # Perform the update operation in the database
         result = products_collection.update_one(
             {"_id": obj_id},
             {"$set": update_payload}
@@ -950,33 +961,27 @@ async def update_product(product_id: str, updated_data: dict):
 
 
 @app.get("/shop/generate-qr/{shop_id}")
-async def generate_shop_qr(shop_id: str):
-    """
-    Generates a QR code image encoding a deep link to the specific shop.
-    Returns the image directly as a PNG stream.
-    """
+async def generate_shop_qr(shop_id: str, request: Request): # <--- ADDED request: Request
     try:
         if not ObjectId.is_valid(shop_id):
             return JSONResponse(status_code=400, content={"error": "Invalid shop ID format"})
         
-        # Format for deep linking scheme. 
-        # (Frontend AndroidManifest will need <data android:scheme="projectav" android:host="shop" />)
-        deep_link_url = f"projectav://shop/{shop_id}"
+        # DYNAMIC URL: This will automatically use your local IP now, 
+        # and will automatically use your real domain when you deploy!
+        base_url = str(request.base_url).rstrip("/")
+        deep_link_url = f"{base_url}/shop/{shop_id}"
         
-        # Generate QR code
         qr = qrcode.QRCode(
-            version=1,
+            version=2,
             error_correction=qrcode.constants.ERROR_CORRECT_L,
             box_size=10,
-            border=4,
+            border=1,
         )
         qr.add_data(deep_link_url)
         qr.make(fit=True)
 
-        # Create image
         img = qr.make_image(fill_color="black", back_color="white")
         
-        # Save to buffer and return as streaming response
         buf = BytesIO()
         img.save(buf, format="PNG")
         buf.seek(0)
@@ -985,6 +990,54 @@ async def generate_shop_qr(shop_id: str):
     except Exception as e:
         logger.error(f"Error generating QR code: {str(e)}")
         return JSONResponse(status_code=500, content={"error": "Failed to generate QR code"})
+
+
+# =================================================================
+# 3. ADD THIS COMPLETELY NEW ENDPOINT ANYWHERE IN main.py
+# =================================================================
+@app.get("/shop/{shop_id}", response_class=HTMLResponse)
+async def shop_redirect(shop_id: str):
+    """
+    The Magic Redirect Page. 
+    If they don't have the app, this page opens in their browser and sends them to the Play Store.
+    """
+    # Replace 'com.av.projectav' with your exact Play Store package name if different
+    play_store_link = "https://play.google.com/store/apps/details?id=com.av.projectav"
+    
+    # This is the custom scheme we put in your AndroidManifest.xml!
+    app_link = f"projectav://shop/{shop_id}"
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>AV - Opening Shop...</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{ font-family: sans-serif; text-align: center; padding: 40px; background-color: #F6F6F6; color: #333; }}
+            .loader {{ border: 4px solid #f3f3f3; border-top: 4px solid #6200EE; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 20px auto; }}
+            @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
+        </style>
+        <script>
+            window.onload = function() {{
+                // 1. Instantly try to open the AV App
+                window.location.href = "{app_link}";
+                
+                // 2. If it fails (meaning app isn't installed), wait 2.5 seconds and go to Play Store
+                setTimeout(function() {{
+                    window.location.href = "{play_store_link}";
+                }}, 2500);
+            }};
+        </script>
+    </head>
+    <body>
+        <h2>Redirecting to the AV App...</h2>
+        <div class="loader"></div>
+        <p>If you don't have the app installed, you will be automatically redirected to the Play Store in a moment.</p>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
         
 
 @app.get("/products/deals")
