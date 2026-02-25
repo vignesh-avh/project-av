@@ -207,7 +207,6 @@ async def get_shops(
 ):
     try:
         background_tasks.add_task(check_missed_opportunities, product_name, user_lat, user_lng)
-        # Searches for the exact input (e.g., "Kirana Items") in Name OR Category.
         search_regex = {"$regex": product_name, "$options": "i"}
         
         query = {
@@ -225,10 +224,8 @@ async def get_shops(
         if not matching_products:
             return {"shops": []}
 
-        # Get unique owner IDs from matching products
         owner_ids = list(set([p["owner_id"] for p in matching_products]))
         
-        # Find shops for these owners
         shops = list(shops_collection.find({
             "owner_id": {"$in": owner_ids}
         }))
@@ -242,10 +239,14 @@ async def get_shops(
                 
             distance = haversine(user_lat, user_lng, shop_lat, shop_lng)
             
-            # Get products for this specific shop
+            # --- UPDATED: Grab BOTH product names and their images ---
             shop_products = [
                 p["product_name"] for p in matching_products
                 if p["owner_id"] == shop["owner_id"]
+            ]
+            shop_images = [
+                p.get("imageUrl") for p in matching_products 
+                if p["owner_id"] == shop["owner_id"] and p.get("imageUrl")
             ]
                 
             shops_with_products.append({
@@ -255,19 +256,17 @@ async def get_shops(
                 "latitude": float(shop_lat),
                 "longitude": float(shop_lng),
                 "products": shop_products,
+                "preview_images": shop_images, # <-- NEW: Included for UI
                 "distance": distance
             })
         
-        # Sort by distance
         shops_with_products.sort(key=lambda x: x["distance"])
         return {"shops": shops_with_products}
 
     except Exception as e:
         print(f"Error in get_shops: {str(e)}")
         return {"shops": []}
-
-# FIXED: Direction-ready shop data
-# REPLACE YOUR EXISTING get_shop ENDPOINT IN shops.py WITH THIS ONE
+        
 @router.get("/get-shop")
 async def get_shop(id: str = Query(...)):
     try:
@@ -867,10 +866,10 @@ async def get_nearby_shops(
     lat: float = Query(...),
     lng: float = Query(...),
     limit: int = 20,
-    category: str = Query(None) # <-- NEW: Added category parameter
+    category: str = Query(None) # <-- Category filter already exists
 ):
     try:
-        # Base GeoNear pipeline
+        # Base GeoNear pipeline (5km radius kept as requested for the home list)
         pipeline = [
             {
                 "$geoNear": {
@@ -882,7 +881,7 @@ async def get_nearby_shops(
             }
         ]
 
-        # <-- NEW: Filter condition for category
+        # Filter condition for category
         product_match = { "$expr": { "$eq": [ "$shop_id", "$$shop_id_str" ] } }
         if category and category != "All":
             product_match["category"] = category
@@ -905,17 +904,19 @@ async def get_nearby_shops(
         pipeline.extend([
             {
                 "$addFields": {
-                    "total_views": { "$ifNull": ["$view_count", 0] } 
+                    "total_views": { "$ifNull": ["$view_count", 0] },
+                    "total_sales": { "$ifNull": ["$sale_count", 0] } # <-- NEW: Included sales for ranking
                 }
             },
-            { "$sort": { "total_views": -1, "distance_in_meters": 1 } },  
+            # <-- NEW: Sort by views AND sales only (most popular)
+            { "$sort": { "total_views": -1, "total_sales": -1 } },  
             { "$limit": limit }, 
             {
                 "$lookup": {
                     "from": "products",
                     "let": { "shop_id_str": { "$toString": "$_id" } },
                     "pipeline": [
-                        { "$match": product_match }, # <-- NEW: Applies the category filter to preview products too
+                        { "$match": product_match }, # Applies the category filter to preview products too
                         { "$limit": 4 }
                     ],
                     "as": "preview_products"
@@ -928,6 +929,7 @@ async def get_nearby_shops(
                     "rating": 1,
                     "distance": {"$divide": ["$distance_in_meters", 1000]},
                     "total_views": 1,
+                    "total_sales": 1, # Return to frontend if needed
                     "preview_images": "$preview_products.imageUrl",
                     "products": "$preview_products.product_name"
                 }

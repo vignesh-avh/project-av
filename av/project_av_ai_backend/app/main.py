@@ -1157,7 +1157,7 @@ async def get_shops(
             shop_products = [p for p in matching_products if p.get("shop_id") == shop_id_str]
             
             shop_list.append({
-                "id": shop_id_str,
+                "_id": shop_id_str, # Updated to _id so frontend serialization doesn't break
                 "name": shop["name"],
                 "rating": shop.get("rating"),
                 "store": shop.get("store"),
@@ -1168,15 +1168,15 @@ async def get_shops(
                     "price": p["price"],
                     "unit": p["unit"],
                     "inStock": p.get("inStock", True)
-                } for p in shop_products]
+                } for p in shop_products],
+                "preview_images": [p.get("imageUrl") for p in shop_products if p.get("imageUrl")] # <-- NEW: Included for UI
             })
             
         return {"shops": shop_list}
     except Exception as e:
         print(f"Error in get_shops: {str(e)}")
         return {"shops": []}
-
-# New endpoints for coin system
+        
 # Update get-user-coins endpoint
 @app.get("/get-user-coins")
 async def get_user_coins(user_id: str = Query(...)):
