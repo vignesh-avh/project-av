@@ -594,45 +594,37 @@ async def checkout_cart(cart_items: List[dict]):
                 content={"error": "Cart is empty."}
             )
 
-        # ================== START OF CORRECTION ==================
-        # This new logic robustly finds the user, whether the ID is an email or an ObjectId.
-        
         user_identifier = cart_items[0]['user_id']
         user = None
 
-        # Check if the identifier is a valid ObjectId
         if ObjectId.is_valid(user_identifier):
             user = users_collection.find_one({"_id": ObjectId(user_identifier)})
         
-        # If not a valid ObjectId or user not found, assume it's a uid/email
         if not user:
             user = users_collection.find_one({"uid": user_identifier})
 
-        # If user is still not found, return an error
         if not user:
             return JSONResponse(
                 status_code=404,
                 content={"error": f"User not found with identifier: {user_identifier}"}
             )
         
-        # Use the real database _id for all subsequent operations
         user_db_id = user["_id"]
         
-        # ---> FIX: Define reward_amount BEFORE creating the order_doc
-        reward_amount = 3
+        # ---> FIX: Calculate dynamic reward_amount based on total quantity
+        total_items = sum(item.get("quantity", 1) for item in cart_items)
+        reward_amount = 3 * total_items
         
         order_doc = {
-            "user_id": str(user_db_id),  # store as string for easy query
+            "user_id": str(user_db_id),
             "items": [item["product_name"] for item in cart_items],
             "total_amount": sum(item["price"] * item["quantity"] for item in cart_items),
-            "coins_earned": reward_amount, # <--- BUG FIXED: Variable is now defined
+            "coins_earned": reward_amount,
             "timestamp": datetime.utcnow()
         }
         
-        # Assuming you have defined orders_collection in db.py
         orders_collection.insert_one(order_doc)
 
-        # Decrement product count (this logic is now safe)
         for item in cart_items:
             product_id = safe_object_id(item.get("id"))
             quantity = item.get("quantity", 1)
@@ -641,22 +633,18 @@ async def checkout_cart(cart_items: List[dict]):
                 {"$inc": {"count": -quantity}}
             )
         
-        # Insert cart items into the cart collection (this logic is correct)
-        result = cart_collection.insert_many(cart_items)
+        cart_collection.insert_many(cart_items)
         
-        # Update user document using the correct ID
         users_collection.update_one(
             {"_id": user_db_id},
             {"$inc": {"coins": reward_amount}}
         )
         
-        # Get updated coin balance
         updated_user = users_collection.find_one({"_id": user_db_id})
         updated_coins = updated_user.get("coins", 0)
         
-        # Add reward transaction
         rewards_collection.insert_one({
-            "user_id": str(user_db_id), # Store the ID as a string
+            "user_id": str(user_db_id),
             "coins": reward_amount,
             "type": "checkout",
             "created_at": datetime.utcnow()
@@ -665,11 +653,11 @@ async def checkout_cart(cart_items: List[dict]):
         return {
             "message": "Checkout successful", 
             "status": "success",
-            "updated_coins": updated_coins
+            "updated_coins": updated_coins,
+            "coins_earned": reward_amount # ---> NEW: Returned for the popup UI
         }
         
     except Exception as e:
-        # Improved error logging to help debug future issues
         logger.error(f"Checkout failed unexpectedly: {traceback.format_exc()}")
         return JSONResponse(
             status_code=500, 
@@ -723,7 +711,41 @@ async def add_item_to_cart(request: AddToCartRequest):
 @app.get("/get-cart")
 async def get_cart(user_id: str = Query(...)):
     try:
-        items = list(cart_collection.find({"user_id": user_id}, {"_id": 0}))
+        # ---> FIX: Use aggregation to fetch shop lat/lng for grouped navigation
+        pipeline = [
+            {"$match": {"user_id": user_id}},
+            {"$addFields": {
+                "shop_obj_id": {
+                    "$convert": {
+                        "input": "$shop_id",
+                        "to": "objectId",
+                        "onError": None,
+                        "onNull": None
+                    }
+                }
+            }},
+            {"$lookup": {
+                "from": "shops",
+                "localField": "shop_obj_id",
+                "foreignField": "_id",
+                "as": "shop_details"
+            }},
+            {"$unwind": {"path": "$shop_details", "preserveNullAndEmptyArrays": True}},
+            {"$project": {
+                "_id": 0,
+                "product_name": 1,
+                "price": 1,
+                "unit": 1,
+                "quantity": 1,
+                "user_id": 1,
+                "shop_id": 1,
+                "timestamp": 1,
+                "shop_name": {"$ifNull": ["$shop_details.name", "Unknown Shop"]},
+                "shop_lat": "$shop_details.latitude",
+                "shop_lng": "$shop_details.longitude"
+            }}
+        ]
+        items = list(cart_collection.aggregate(pipeline))
         return {"cart": items}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
