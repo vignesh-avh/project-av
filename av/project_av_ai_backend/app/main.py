@@ -562,9 +562,45 @@ async def add_product(
         return JSONResponse(status_code=500, content={"error": f"Failed to add product: {str(e)}"})
 
 @app.get("/get-products/")
-async def get_products(owner_id: str = Query(...)):
+async def get_products(owner_id: str = Query(...), section: str = Query(None), category: str = Query(None)):
     try:
-        products = list(products_collection.find({"owner_id": owner_id}))
+        # 1. Clean up expired promotions first (Real-time check)
+        products_collection.update_many(
+            {
+                "owner_id": owner_id, 
+                "isOnSale": True, 
+                "saleEndDate": {"$lt": datetime.utcnow()}
+            },
+            {
+                "$unset": {
+                    "isOnSale": "",
+                    "salePrice": "",
+                    "saleDescription": "",
+                    "saleEndDate": ""
+                }
+            }
+        )
+        
+        # 2. Build query based on section rules
+        query = {"owner_id": owner_id}
+        
+        if section == "in_stock":
+            query["count"] = {"$gte": 15}
+            query["$or"] = [{"isOnSale": {"$ne": True}}, {"isOnSale": {"$exists": False}}]
+        elif section == "low_stock":
+            query["count"] = {"$gt": 0, "$lte": 14}
+            query["$or"] = [{"isOnSale": {"$ne": True}}, {"isOnSale": {"$exists": False}}]
+        elif section == "no_stock":
+            query["count"] = {"$lte": 0}
+            query["$or"] = [{"isOnSale": {"$ne": True}}, {"isOnSale": {"$exists": False}}]
+        elif section == "promotion":
+            query["isOnSale"] = True
+            
+        # 3. Apply category filter if requested by frontend
+        if category and category != "All":
+            query["category"] = category
+            
+        products = list(products_collection.find(query))
         
         # Convert MongoDB ObjectId to string
         for product in products:
@@ -667,6 +703,116 @@ async def checkout_cart(cart_items: List[dict]):
 class AddToCartRequest(BaseModel):
     product_id: str
     user_id: str
+
+
+class SectionBulkUpdateRequest(BaseModel):
+    owner_id: str
+    section: str # Accepts: "in_stock", "low_stock", "no_stock"
+    action: str  # Accepts: "increment" or "set"
+    value: int   # The specified amount (+1, +3, or 10)
+
+@app.post("/owner/bulk-update-section")
+async def bulk_update_section(request: SectionBulkUpdateRequest):
+    try:
+        now = datetime.utcnow()
+        
+        # Base query ensures we DO NOT modify products currently on promotion
+        base_query = {
+            "owner_id": request.owner_id,
+            "$or": [
+                {"isOnSale": {"$ne": True}},
+                {"isOnSale": {"$exists": False}}
+            ]
+        }
+        
+        # Determine target boundaries and timestamp field based on section
+        if request.section == "in_stock":
+            query = {**base_query, "count": {"$gte": 15}}
+            timestamp_field = "last_pressed_in_stock"
+        elif request.section == "low_stock":
+            query = {**base_query, "count": {"$gt": 0, "$lte": 14}}
+            timestamp_field = "last_pressed_low_stock"
+        elif request.section == "no_stock":
+            query = {**base_query, "count": {"$lte": 0}}
+            timestamp_field = "last_pressed_no_stock"
+        else:
+            raise HTTPException(status_code=400, detail="Invalid section")
+
+        # --- NEW: 10-Hour Cooldown Validation ---
+        shop = shops_collection.find_one({"owner_id": request.owner_id})
+        if not shop:
+            raise HTTPException(status_code=404, detail="Shop not found")
+
+        last_pressed = shop.get(timestamp_field)
+        if last_pressed:
+            # Handle both string and datetime formats safely
+            if isinstance(last_pressed, str):
+                try:
+                    last_pressed = datetime.fromisoformat(last_pressed.replace('Z', '+00:00')).replace(tzinfo=None)
+                except ValueError:
+                    pass # Fallback if parsing fails
+
+            if isinstance(last_pressed, datetime):
+                time_since_last_press = now - last_pressed
+                cooldown_period = timedelta(hours=10)
+                
+                if time_since_last_press < cooldown_period:
+                    remaining_time = cooldown_period - time_since_last_press
+                    hours, remainder = divmod(remaining_time.seconds, 3600)
+                    minutes, _ = divmod(remainder, 60)
+                    raise HTTPException(
+                        status_code=429, 
+                        detail=f"Cooldown active. Please wait {hours}h {minutes}m."
+                    )
+        # -----------------------------------------
+            
+        # Determine the atomic update operation
+        if request.action == "increment":
+            update_operation = {"$inc": {"count": request.value}, "$set": {"last_updated": now, "inStock": True}}
+        elif request.action == "set":
+            update_operation = {"$set": {"count": request.value, "last_updated": now, "inStock": True}}
+        else:
+            raise HTTPException(status_code=400, detail="Invalid action. Use 'increment' or 'set'.")
+            
+        # 1. Execute atomic bulk update on products
+        products_result = products_collection.update_many(query, update_operation)
+        
+        # 2. Log the button press timestamp for the UI color logic
+        shops_collection.update_one(
+            {"owner_id": request.owner_id},
+            {"$set": {timestamp_field: now}}
+        )
+        
+        return {
+            "success": True, 
+            "modified_count": products_result.modified_count,
+            "message": f"Successfully updated {products_result.modified_count} products.",
+            "new_timestamp": now.isoformat() # <-- NEW: Return new timestamp for frontend local state updates
+        }
+    except HTTPException as he:
+        raise he # Ensure HTTP exceptions (like our 429 Cooldown) are passed to the frontend
+    except Exception as e:
+        logger.error(f"Bulk update section error: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+        
+
+@app.get("/owner/shop-section-timestamps")
+async def get_shop_section_timestamps(owner_id: str = Query(...)):
+    try:
+        shop = shops_collection.find_one({"owner_id": owner_id})
+        if not shop:
+            return JSONResponse(status_code=404, content={"error": "Shop not found"})
+            
+        def format_timestamp(ts):
+            return ts.isoformat() if isinstance(ts, datetime) else None
+
+        return {
+            "last_pressed_in_stock": format_timestamp(shop.get("last_pressed_in_stock")),
+            "last_pressed_low_stock": format_timestamp(shop.get("last_pressed_low_stock")),
+            "last_pressed_no_stock": format_timestamp(shop.get("last_pressed_no_stock"))
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/cart/add-item")
 async def add_item_to_cart(request: AddToCartRequest):
@@ -946,10 +1092,8 @@ async def update_product(product_id: str, updated_data: dict):
         if "unit" in updated_data:
             update_payload["unit"] = updated_data["unit"]
 
-        # --- NEW: Category Validation for Updates ---
+        # --- FIX: Removed strict category validation to prevent 400 Bad Request errors ---
         if "category" in updated_data:
-            if updated_data["category"] not in VALID_CATEGORIES and updated_data["category"] != "All":
-                return JSONResponse(status_code=400, content={"error": f"Invalid category: {updated_data['category']}"})
             update_payload["category"] = updated_data["category"]
             
         if "inStock" in updated_data:
