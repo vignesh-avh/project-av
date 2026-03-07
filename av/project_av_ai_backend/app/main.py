@@ -85,7 +85,8 @@ from app.notifications import ( # Import your new notification functions
     send_customer_morning_essentials,
     send_customer_deals_reminder,
     send_subscription_reminders,
-    send_owner_availability_request
+    send_owner_availability_request,
+    send_owner_new_order_alert
     # Add other customer functions here later
 )
 from pydantic import BaseModel # Ensure this is imported
@@ -621,8 +622,9 @@ class CartItem(BaseModel):
     timestamp: str # Added for proper document structure
 
 
+# REPLACE THE EXISTING /checkout-cart/ ENDPOINT IN main.py WITH THIS UPDATED BLOCK
 @app.post("/checkout-cart/")
-async def checkout_cart(cart_items: List[dict]):
+async def checkout_cart(cart_items: List[dict], background_tasks: BackgroundTasks): # <-- Added background_tasks here
     try:
         if not cart_items:
             return JSONResponse(
@@ -647,7 +649,6 @@ async def checkout_cart(cart_items: List[dict]):
         
         user_db_id = user["_id"]
         
-        # ---> FIX: Calculate dynamic reward_amount based on total quantity
         total_items = sum(item.get("quantity", 1) for item in cart_items)
         reward_amount = 3 * total_items
         
@@ -661,7 +662,20 @@ async def checkout_cart(cart_items: List[dict]):
         
         orders_collection.insert_one(order_doc)
 
+        # --- NEW: Group items by shop_id for notifications ---
+        items_by_shop = {}
+
         for item in cart_items:
+            shop_id = item.get("shop_id")
+            prod_name = item.get("product_name")
+            
+            if shop_id and prod_name:
+                if shop_id not in items_by_shop:
+                    items_by_shop[shop_id] = []
+                # Include quantity in the notification string
+                qty = item.get("quantity", 1)
+                items_by_shop[shop_id].append(f"{qty}x {prod_name}")
+
             product_id = safe_object_id(item.get("id"))
             quantity = item.get("quantity", 1)
             products_collection.update_one(
@@ -686,11 +700,15 @@ async def checkout_cart(cart_items: List[dict]):
             "created_at": datetime.utcnow()
         })
         
+        # --- NEW: Trigger push notifications to respective owners in background ---
+        for shop_id_str, product_names in items_by_shop.items():
+            background_tasks.add_task(send_owner_new_order_alert, shop_id_str, product_names)
+        
         return {
             "message": "Checkout successful", 
             "status": "success",
             "updated_coins": updated_coins,
-            "coins_earned": reward_amount # ---> NEW: Returned for the popup UI
+            "coins_earned": reward_amount
         }
         
     except Exception as e:

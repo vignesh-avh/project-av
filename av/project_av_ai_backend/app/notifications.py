@@ -576,3 +576,45 @@ async def send_owner_fomo_alert(owner_id: str, product_name: str):
 
     except Exception as e:
         logger.error(f"Error in send_owner_fomo_alert: {e}", exc_info=True)
+
+
+# ADD THIS NEW FUNCTION IN app/notifications.py
+async def send_owner_new_order_alert(shop_id_str: str, product_names: list):
+    """
+    Sends a high-priority notification to the shop owner that a customer is coming to pick up items.
+    """
+    try:
+        from bson import ObjectId
+        shop = shops_collection.find_one({"_id": ObjectId(shop_id_str)})
+        if not shop:
+            return
+        
+        owner_id = shop.get("owner_id")
+        owner = users_collection.find_one({"uid": owner_id})
+        if not owner and ObjectId.is_valid(owner_id):
+            owner = users_collection.find_one({"_id": ObjectId(owner_id)})
+            
+        if not owner:
+            return
+
+        tokens = owner.get("fcm_tokens", [])
+        if not tokens:
+            return
+
+        # Format items like: "2x Milk, 1x Bread"
+        items_str = ", ".join(product_names)
+        title = "🚨 New Order! Customer arriving soon"
+        body = f"A customer is coming to pick up: {items_str}. Please keep it ready!"
+        
+        data_payload = {
+            "type": "new_order",
+            "shop_id": shop_id_str,
+            "priority": "high",
+            "sound": "default"
+        }
+
+        await send_fcm_notification(tokens, title, body, data_payload)
+        logger.info(f"Sent new order alert to owner {owner_id} for shop {shop_id_str}")
+
+    except Exception as e:
+        logger.error(f"Error in send_owner_new_order_alert: {e}", exc_info=True)
